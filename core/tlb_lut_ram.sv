@@ -163,8 +163,10 @@ module tlb_lut_ram
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     multiple_tag_hit_in_tlb:
         assert property (@(posedge clk) disable iff (rst) (tlb.done) |-> $onehot(tag_hit))
         else $error("Multiple tag hits in TLB!");
+`endif
 
 endmodule

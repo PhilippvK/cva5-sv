@@ -28,6 +28,7 @@ module cva5
     import l2_config_and_types::*;
     import riscv_types::*;
     import cva5_types::*;
+    import scaiev_types::*; //SCAIE-V
 
     #(
         parameter cpu_config_t CONFIG = EXAMPLE_CONFIG
@@ -49,6 +50,8 @@ module cva5
 
         l2_requester_interface.master l2,
 
+        scaiev_interface.core scaiev,
+
         input interrupt_t s_interrupt,
         input interrupt_t m_interrupt
         );
@@ -64,8 +67,9 @@ module cva5
     localparam int unsigned CSR_UNIT_ID = LS_UNIT_ID + int'(CONFIG.INCLUDE_CSRS);
     localparam int unsigned MUL_UNIT_ID = CSR_UNIT_ID + int'(CONFIG.INCLUDE_MUL);
     localparam int unsigned DIV_UNIT_ID = MUL_UNIT_ID + int'(CONFIG.INCLUDE_DIV);
+    localparam int unsigned SCAIEV_UNIT_ID = DIV_UNIT_ID + int'(CONFIG.INCLUDE_SCAIEV); //SCAIE-V
     //Non-writeback units
-    localparam int unsigned BRANCH_UNIT_ID = DIV_UNIT_ID + 1;
+    localparam int unsigned BRANCH_UNIT_ID = SCAIEV_UNIT_ID + 1;
     localparam int unsigned IEC_UNIT_ID = BRANCH_UNIT_ID + 1;
 
     //Total number of units
@@ -77,6 +81,7 @@ module cva5
         CSR : CSR_UNIT_ID,
         MUL : MUL_UNIT_ID,
         DIV : DIV_UNIT_ID,
+        SCAIEV : SCAIEV_UNIT_ID, //SCAIE-V
         BR : BRANCH_UNIT_ID,
         IEC : IEC_UNIT_ID
     };
@@ -85,7 +90,7 @@ module cva5
     //Writeback Port Assignment
     //
     localparam int unsigned NUM_WB_UNITS_GROUP_1 = 1;//ALU
-    localparam int unsigned NUM_WB_UNITS_GROUP_2 = 1 + int'(CONFIG.INCLUDE_CSRS) + int'(CONFIG.INCLUDE_MUL) + int'(CONFIG.INCLUDE_DIV);//LS
+    localparam int unsigned NUM_WB_UNITS_GROUP_2 = 1 + int'(CONFIG.INCLUDE_CSRS) + int'(CONFIG.INCLUDE_MUL) + int'(CONFIG.INCLUDE_DIV) + int'(CONFIG.INCLUDE_SCAIEV);//LS //SCAIE-V
     localparam int unsigned NUM_WB_UNITS = NUM_WB_UNITS_GROUP_1 + NUM_WB_UNITS_GROUP_2;
 
     ////////////////////////////////////////////////////
@@ -96,10 +101,10 @@ module cva5
     logic sc_success;
 
     branch_predictor_interface bp();
-    branch_results_t br_results;
-    logic branch_flush;
+    branch_results_t br_results_branch;
+    logic branch_flush_branch;
     logic potential_branch_exception;
-    exception_packet_t br_exception;
+    exception_interface br_exception();
     logic branch_exception_is_jump;
 
     ras_interface ras();
@@ -115,6 +120,7 @@ module cva5
     div_inputs_t div_inputs;
     gc_inputs_t gc_inputs;
     csr_inputs_t csr_inputs;
+    scaiev_inputs_t scaiev_inputs; //SCAIE-V
 
     unit_issue_interface unit_issue [NUM_UNITS-1:0]();
 
@@ -131,12 +137,40 @@ module cva5
     logic tlb_on;
     logic [ASIDLEN-1:0] asid;
 
+    //SCAIE-V LS, Branch Hooks, various logic
+    logic scaiev_decode_inject;
+    logic pc_inject_keep_for_repeat;
+    logic pc_inject_is_repeat;
+    unit_writeback_interface ls_unit_wb();  //unit_wb[UNIT_IDS.LS]
+    unit_issue_interface ls_unit_issue(); //unit_issue[UNIT_IDS.LS]
+
+    unit_issue_interface ls_issue_scaiev();
+    unit_writeback_interface ls_wb_scaiev();
+
+    load_store_inputs_t ls_inputs_scaiev;
+
+    branch_results_t br_results;
+    logic branch_flush;
+
+    load_store_inputs_t ls_inputs_actual;
+    scaiev_ls_meta_t ls_wb_scaiev_meta;
+    scaiev_ls_meta_t ls_issue_scaiev_meta;
+
+    logic scaiev_stall_issue;
+
+    branch_results_t br_results_scaiev;
+    logic br_results_scaiev_override;
+    logic branch_flush_scaiev;
+    exception_interface br_exception_scaiev();
+
     //Instruction ID/Metadata
         //ID issuing
     id_t pc_id;
     logic pc_id_available;
     logic pc_id_assigned;
     logic [31:0] if_pc;
+    logic pc_inject_id_available; //SCAIE-V
+    logic pc_inject_id_assigned; //SCAIE-V
         //Fetch stage
     id_t fetch_id;
     logic fetch_complete;
@@ -146,8 +180,10 @@ module cva5
     fetch_metadata_t fetch_metadata;
         //Decode stage
     logic decode_advance;
-    decode_packet_t decode;   
+    decode_packet_t decode;
     logic decode_uses_rd;
+    logic decode_uses_rd_decoupled; //SCAIE-V
+    logic issue_uses_rd_decoupled; //SCAIE-V
     rs_addr_t decode_rd_addr;
     exception_sources_t decode_exception_unit;
     phys_addr_t decode_phys_rd_addr;
@@ -191,7 +227,7 @@ module cva5
     logic instruction_issued_with_rd;
 
     //LS
-    wb_packet_t wb_snoop;
+    wb_forward_packet_t wb_snoop;
 
     //Trace Interface Signals
     logic tr_early_branch_correction;
@@ -231,6 +267,134 @@ module cva5
     ////////////////////////////////////////////////////
     //Implementation
 
+    generate if (CONFIG.INCLUDE_SCAIEV) begin : gen_scaiev_ls
+            //If ls_wb_scaiev_meta - Connect ls_unit_wb <-> ls_wb_scaiev
+            //Default - Connect ls_unit_wb <-> unit_wb[UNIT_IDS.LS]
+            assign ls_unit_wb.ack = unit_wb[UNIT_IDS.LS].ack | ls_wb_scaiev.ack;
+
+            assign unit_wb[UNIT_IDS.LS].id = ls_unit_wb.id;
+            assign unit_wb[UNIT_IDS.LS].done = ~ls_wb_scaiev_meta.is_scaiev & ls_unit_wb.done;
+            assign unit_wb[UNIT_IDS.LS].rd = ls_unit_wb.rd;
+
+            assign ls_wb_scaiev.id = ls_unit_wb.id;
+            assign ls_wb_scaiev.done = ls_wb_scaiev_meta.is_scaiev & ls_unit_wb.done;
+            assign ls_wb_scaiev.rd = ls_unit_wb.rd;
+
+            //If ls_issue_scaiev.new_request - Connect ls_unit_issue <-> ls_issue_scaiev
+            //Default - Connect ls_unit_issue <-> unit_issue[UNIT_IDS.LS]
+            assign ls_issue_scaiev.ready = ls_unit_issue.ready;
+            assign unit_issue[UNIT_IDS.LS].ready = ls_unit_issue.ready;
+            assign ls_unit_issue.possible_issue = ls_issue_scaiev.possible_issue || unit_issue[UNIT_IDS.LS].possible_issue;
+            assign ls_unit_issue.new_request = ls_issue_scaiev.possible_issue ? ls_issue_scaiev.new_request : unit_issue[UNIT_IDS.LS].new_request;
+            assign ls_unit_issue.id = ls_issue_scaiev.possible_issue ? ls_issue_scaiev.id : unit_issue[UNIT_IDS.LS].id;
+
+            //If ls_issue_scaiev.new_request - Connect ls_inputs_actual <- ls_inputs_scaiev
+            //Default - Connect ls_inputs_actual <- ls_inputs
+            assign ls_inputs_actual = ls_issue_scaiev.possible_issue ? ls_inputs_scaiev : ls_inputs;
+
+            assign ls_issue_scaiev_meta.is_scaiev = ls_issue_scaiev.possible_issue;
+        end
+        else begin
+            //Connect ls_unit_wb <-> unit_wb[UNIT_IDS.LS]
+            assign ls_unit_wb.ack = unit_wb[UNIT_IDS.LS].ack;
+            assign unit_wb[UNIT_IDS.LS].id = ls_unit_wb.id;
+            assign unit_wb[UNIT_IDS.LS].done = ls_unit_wb.done;
+            assign unit_wb[UNIT_IDS.LS].rd = ls_unit_wb.rd;
+
+            //Connect ls_unit_issue <-> unit_issue[UNIT_IDS.LS]
+            assign unit_issue[UNIT_IDS.LS].ready = ls_unit_issue.ready;
+            assign ls_unit_issue.possible_issue = unit_issue[UNIT_IDS.LS].possible_issue;
+            assign ls_unit_issue.new_request = unit_issue[UNIT_IDS.LS].new_request;
+            assign ls_unit_issue.id = unit_issue[UNIT_IDS.LS].id;
+
+            //Connect ls_inputs_actual <- ls_inputs
+            assign ls_inputs_actual = ls_inputs;
+
+            assign ls_issue_scaiev_meta.is_scaiev = 0;
+            assign ls_issue_scaiev_meta.fromstage = 'X;
+        end
+    endgenerate
+
+
+    generate if (CONFIG.INCLUDE_SCAIEV) begin : gen_scaiev_branch
+            assign branch_flush = branch_flush_branch | branch_flush_scaiev;
+            assign br_results = br_results_scaiev_override ? br_results_scaiev : br_results_branch;
+
+            //Based on branch_unit code.
+            //TODO: Cancel the ISAX issue in case of an exception?
+            logic br_exception_scaiev_select;
+            logic new_exception;
+            assign new_exception = |br_results_scaiev.target_pc[1:0] & branch_flush_scaiev;
+            always_ff @(posedge clk) begin
+                if (rst) begin
+                    br_exception_scaiev.valid <= 0;
+                    br_exception_scaiev_select <= 0;
+                end
+                else begin
+                    br_exception_scaiev.valid <= (br_exception_scaiev.valid & ~br_exception_scaiev.ack) | new_exception;
+                    br_exception_scaiev_select <= (br_exception_scaiev_select & ~br_exception_scaiev.ack) | (new_exception & ~br_exception.valid);
+                end
+            end
+
+            logic [31:0] exception_tval_pc;
+            always_ff @(posedge clk) begin
+                if (branch_flush_scaiev) begin
+                    br_exception_scaiev.id <= br_results_scaiev.id;
+                    exception_tval_pc <= br_results_scaiev.target_pc;
+                end
+            end
+            assign br_exception_scaiev.code = INST_ADDR_MISSALIGNED;
+            assign br_exception_scaiev.tval = exception_tval_pc;
+
+            assign exception[BR_EXCEPTION].valid = br_exception_scaiev.valid | br_exception.valid;
+            assign exception[BR_EXCEPTION].code = br_exception_scaiev_select ? br_exception_scaiev.code : br_exception.code;
+            assign exception[BR_EXCEPTION].id = br_exception_scaiev_select ? br_exception_scaiev.id : br_exception.id;
+            assign exception[BR_EXCEPTION].tval = br_exception_scaiev_select ? br_exception_scaiev.tval : br_exception.tval;
+            assign br_exception_scaiev.ack = br_exception_scaiev_select & exception[BR_EXCEPTION].ack;
+            assign br_exception.ack = (~br_exception_scaiev_select) & exception[BR_EXCEPTION].ack;
+            //br_exception_scaiev.valid ? br_exception_scaiev : br_exception;
+        end
+        else begin
+            assign branch_flush = branch_flush_branch;
+            assign br_results = br_results_branch;
+
+            assign br_exception_scaiev.valid = 0;
+            assign br_exception_scaiev.id = 'X;
+            assign br_exception_scaiev.code = 'X;
+            assign br_exception_scaiev.tval = 'X;
+
+            assign exception[BR_EXCEPTION].valid = br_exception.valid;
+            assign exception[BR_EXCEPTION].code = br_exception.code;
+            assign exception[BR_EXCEPTION].id = br_exception.id;
+            assign exception[BR_EXCEPTION].tval = br_exception.tval;
+            assign br_exception.ack = exception[BR_EXCEPTION].ack;
+        end
+    endgenerate
+
+    //Stage definitions for SCAIE-V:
+    //0 - Fetch (most relevant code files: fetch.sv, instruction_metadata_and_id_management.sv)
+    //1 - Decode (instruction_metadata_and_id_management.sv, decode_and_issue.sv, register_file.sv)
+    //2 - Issue (register_file.sv, decode_and_issue.sv, scaiev_unit.sv)
+    //3 - Execute (scaiev_unit.sv)
+
+    assign scaiev.fetch_fetchID = pc_id;
+    //assign scaiev.fetch_fetchFlushID -> see instruction_metadata_and_id_management.sv
+    //assign scaiev.fetch_PC -> see fetch.sv
+    //assign scaiev.fetch_isStalling -> see fetch.sv
+    //assign scaiev.fetch_Instr = fetch_instruction;
+    //assign scaiev.fetch_IValid = fetch_complete;
+    assign scaiev.fetch_isFlushing = scaiev.fetch_flush || scaiev.decode_flush || scaiev.issue_flush || gc.fetch_flush;
+    assign scaiev.fetch_isFlushing_internal = scaiev.decode_flush || scaiev.issue_flush || gc.fetch_flush;
+
+    assign scaiev.decode_fetchID = decode.pc_id;
+    assign scaiev.decode_PC = decode.pc;
+    assign scaiev.decode_valid = decode.valid;
+    assign scaiev.decode_Instr = decode.instruction;
+    assign scaiev.decode_isFlushing = scaiev.decode_flush || scaiev.issue_flush || gc.fetch_flush;
+    assign scaiev.decode_isFlushing_internal = scaiev.issue_flush || gc.fetch_flush;
+
+    assign scaiev.issue_isFlushing = scaiev.issue_flush || gc.fetch_flush;
+    assign scaiev.issue_isFlushing_internal = gc.fetch_flush;
 
     ////////////////////////////////////////////////////
     // Memory Interface
@@ -255,10 +419,16 @@ module cva5
         .clk (clk),
         .rst (rst),
         .gc (gc),
+        .scaiev (scaiev),
         .pc_id (pc_id),
         .pc_id_available (pc_id_available),
         .if_pc (if_pc),
         .pc_id_assigned (pc_id_assigned),
+        .scaiev_decode_inject (scaiev_decode_inject),
+        .pc_inject_id_available (pc_inject_id_available),
+        .pc_inject_id_assigned (pc_inject_id_assigned),
+        .pc_inject_keep_for_repeat (pc_inject_keep_for_repeat),
+        .pc_inject_is_repeat (pc_inject_is_repeat),
         .fetch_id (fetch_id),
         .early_branch_flush (early_branch_flush),
         .fetch_complete (fetch_complete),
@@ -292,8 +462,9 @@ module cva5
         .rst (rst),
         .branch_flush (branch_flush),
         .gc (gc),
+        .scaiev (scaiev),
         .pc_id (pc_id),
-        .pc_id_available (pc_id_available),
+        .pc_id_available (pc_id_available & ~scaiev.fetch_stall),
         .pc_id_assigned (pc_id_assigned),
         .fetch_complete (fetch_complete),
         .fetch_metadata (fetch_metadata),
@@ -302,7 +473,7 @@ module cva5
         .early_branch_flush (early_branch_flush),
         .early_branch_flush_ras_adjust (early_branch_flush_ras_adjust),
         .if_pc (if_pc),
-        .fetch_instruction (fetch_instruction),                                
+        .fetch_instruction (fetch_instruction),
         .instruction_bram (instruction_bram), 
         .iwishbone (iwishbone),
         .icache_on ('1),
@@ -315,7 +486,7 @@ module cva5
     );
 
     branch_predictor #(.CONFIG(CONFIG))
-    bp_block (       
+    bp_block (
         .clk (clk),
         .rst (rst),
         .bp (bp),
@@ -335,11 +506,11 @@ module cva5
     generate if (CONFIG.INCLUDE_S_MODE) begin : gen_itlb_immu
 
         tlb_lut_ram #(.WAYS(CONFIG.ITLB.WAYS), .DEPTH(CONFIG.ITLB.DEPTH))
-        i_tlb (       
+        i_tlb (
             .clk (clk),
             .rst (rst),
             .gc (gc),
-            .abort_request (gc.fetch_flush | early_branch_flush),
+            .abort_request (gc.fetch_flush | early_branch_flush | scaiev.fetch_flush | scaiev.decode_flush | scaiev.issue_flush),
             .asid (asid),
             .tlb (itlb), 
             .mmu (immu)
@@ -349,7 +520,7 @@ module cva5
             .clk (clk),
             .rst (rst),
             .mmu (immu) , 
-            .abort_request (gc.fetch_flush),
+            .abort_request (gc.fetch_flush | scaiev.fetch_flush | scaiev.decode_flush | scaiev.issue_flush),
             .l1_request (l1_request[L1_IMMU_ID]), 
             .l1_response (l1_response[L1_IMMU_ID])
         );
@@ -369,8 +540,11 @@ module cva5
         .clk (clk),
         .rst (rst),
         .gc (gc),
+        .scaiev (scaiev),
         .decode_advance (decode_advance),
         .decode (decode_rename_interface),
+        .decode_uses_rd_decoupled (decode_uses_rd_decoupled),
+        .issue_uses_rd_decoupled (issue_uses_rd_decoupled),
         .issue (issue), //packet
         .instruction_issued_with_rd (instruction_issued_with_rd),
         .retire (retire) //packet
@@ -387,10 +561,13 @@ module cva5
         .clk (clk),
         .rst (rst),
         .pc_id_available (pc_id_available),
+        .pc_inject_id_available (pc_inject_id_available),
+        .pc_inject_id_assigned (pc_inject_id_assigned),
         .decode (decode),
         .decode_advance (decode_advance),
         .renamer (decode_rename_interface),
         .decode_uses_rd (decode_uses_rd),
+        .decode_uses_rd_decoupled (decode_uses_rd_decoupled),
         .decode_rd_addr (decode_rd_addr),
         .decode_exception_unit (decode_exception_unit),
         .decode_phys_rd_addr (decode_phys_rd_addr),
@@ -398,6 +575,7 @@ module cva5
         .decode_rs_wb_group (decode_rs_wb_group),
         .instruction_issued (instruction_issued),
         .instruction_issued_with_rd (instruction_issued_with_rd),
+        .issue_uses_rd_decoupled (issue_uses_rd_decoupled),
         .issue (issue),
         .rf (rf_issue),
         .alu_inputs (alu_inputs),
@@ -407,8 +585,14 @@ module cva5
         .csr_inputs (csr_inputs),
         .mul_inputs (mul_inputs),
         .div_inputs (div_inputs),
+        .scaiev_inputs (scaiev_inputs),
+        .scaiev_stall_issue (scaiev_stall_issue),
         .unit_issue (unit_issue),
         .gc (gc),
+        .scaiev (scaiev),
+        .scaiev_decode_inject (scaiev_decode_inject),
+        .pc_inject_keep_for_repeat (pc_inject_keep_for_repeat),
+        .pc_inject_is_repeat (pc_inject_is_repeat),
         .current_privilege (current_privilege),
         .exception (exception[PRE_ISSUE_EXCEPTION]),
         .tr_operand_stall (tr_operand_stall),
@@ -439,11 +623,13 @@ module cva5
         .clk (clk),
         .rst (rst),
         .gc (gc),
+        .scaiev (scaiev),
         .decode_phys_rs_addr (decode_phys_rs_addr),
         .decode_phys_rd_addr (decode_phys_rd_addr),
         .decode_rs_wb_group (decode_rs_wb_group),
         .decode_advance (decode_advance),
         .decode_uses_rd (decode_uses_rd),
+        .decode_uses_rd_decoupled (decode_uses_rd_decoupled),
         .rf_issue (rf_issue),
         .commit (commit_packet)
     );
@@ -453,12 +639,12 @@ module cva5
     branch_unit #(.CONFIG(CONFIG))
     branch_unit_block ( 
         .clk (clk),
-        .rst (rst),                                    
+        .rst (rst),
         .issue (unit_issue[UNIT_IDS.BR]),
         .branch_inputs (branch_inputs),
-        .br_results (br_results),
-        .branch_flush (branch_flush),
-        .exception (exception[BR_EXCEPTION]),
+        .br_results (br_results_branch),
+        .branch_flush (branch_flush_branch),
+        .exception (br_exception),
         .tr_branch_correct (tr_branch_correct),
         .tr_branch_misspredict (tr_branch_misspredict),
         .tr_return_correct (tr_return_correct),
@@ -479,32 +665,34 @@ module cva5
         .clk (clk),
         .rst (rst),
         .gc (gc),
-        .ls_inputs (ls_inputs),
-        .issue (unit_issue[UNIT_IDS.LS]),
+        .ls_inputs (ls_inputs_actual),
+        .issue (ls_unit_issue),
+        .issue_scaiev_meta (ls_issue_scaiev_meta), //SCAIE-V
         .dcache_on (1'b1), 
         .clear_reservation (1'b0), 
         .tlb (dtlb),
-        .tlb_on (tlb_on),                            
+        .tlb_on (tlb_on),
         .l1_request (l1_request[L1_DCACHE_ID]), 
         .l1_response (l1_response[L1_DCACHE_ID]),
         .sc_complete (sc_complete),
-        .sc_success (sc_success),                                       
+        .sc_success (sc_success),
         .m_axi (m_axi),
         .m_avalon (m_avalon),
-        .dwishbone (dwishbone),                                       
+        .dwishbone (dwishbone),
         .data_bram (data_bram),
         .wb_snoop (wb_snoop),
         .retire_ids (retire_ids),
         .retire_port_valid(retire_port_valid),
         .exception (exception[LS_EXCEPTION]),
         .load_store_status(load_store_status),
-        .wb (unit_wb[UNIT_IDS.LS]),
+        .wb (ls_unit_wb),
+        .wb_scaiev_meta (ls_wb_scaiev_meta),
         .tr_load_conflict_delay (tr_load_conflict_delay)
     );
 
     generate if (CONFIG.INCLUDE_S_MODE) begin : gen_dtlb_dmmu
         tlb_lut_ram #(.WAYS(CONFIG.DTLB.WAYS), .DEPTH(CONFIG.DTLB.DEPTH))
-        d_tlb (       
+        d_tlb (
             .clk (clk),
             .rst (rst),
             .gc (gc),
@@ -580,7 +768,8 @@ module cva5
         .interrupt_pending(interrupt_pending),
         .processing_csr(processing_csr),
         .load_store_status(load_store_status),
-        .post_issue_count (post_issue_count)
+        .post_issue_count (post_issue_count),
+        .scaiev (scaiev)
     );
 
     generate if (CONFIG.INCLUDE_MUL) begin : gen_mul
@@ -603,10 +792,39 @@ module cva5
         );
     end endgenerate
 
+    generate if (CONFIG.INCLUDE_SCAIEV) begin : gen_scaiev
+        scaiev_unit scaiev_unit_block (
+            .clk (clk),
+            .rst (rst),
+            .scaiev_inputs (scaiev_inputs),
+            .scaiev (scaiev),
+            .issue (unit_issue[UNIT_IDS.SCAIEV]),
+            .wb (unit_wb[UNIT_IDS.SCAIEV]),
+
+            .ls_inputs_scaiev (ls_inputs_scaiev),
+            .ls_issue_scaiev (ls_issue_scaiev),
+            .ls_wb_scaiev (ls_wb_scaiev),
+            .ls_issue_scaiev_stage (ls_issue_scaiev_meta.fromstage),
+            .ls_wb_scaiev_stage (ls_wb_scaiev_meta.fromstage),
+
+            .ls_exception_valid (exception[LS_EXCEPTION].valid),
+            .ls_exception_id (exception[LS_EXCEPTION].id),
+
+            .stall_issue (scaiev_stall_issue),
+
+            .branch_flush (branch_flush_scaiev),
+            .br_results (br_results_scaiev),
+            .br_results_override (br_results_scaiev_override)
+        );
+    end
+    else begin
+        assign scaiev_stall_issue = 0;
+    end endgenerate
+
     ////////////////////////////////////////////////////
     //Writeback
     //First writeback port: ALU
-    //Second writeback port: LS, CSR, [MUL], [DIV]
+    //Second writeback port: LS, CSR, [MUL], [DIV], [SCAIE-V]
     localparam int unsigned NUM_UNITS_PER_PORT [CONFIG.NUM_WB_GROUPS] = '{NUM_WB_UNITS_GROUP_1, NUM_WB_UNITS_GROUP_2};
     writeback #(
         .CONFIG (CONFIG),
@@ -618,7 +836,8 @@ module cva5
         .rst (rst),
         .wb_packet (wb_packet),
         .unit_wb (unit_wb),
-        .wb_snoop (wb_snoop)
+        .wb_snoop (wb_snoop),
+        .scaiev (scaiev)
     );
 
     ////////////////////////////////////////////////////

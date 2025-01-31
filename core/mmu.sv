@@ -191,6 +191,7 @@ module mmu
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     `ifdef ENABLE_SIMULATION_ASSERTIONS
         mmu_spurious_l1_response:
             assert property (@(posedge clk) disable iff (rst) (l1_response.data_valid) |-> (state[WAIT_REQUEST_1] | state[WAIT_REQUEST_2]))
@@ -203,5 +204,6 @@ module mmu
     mmu_tlb_state_mismatch:
         assert property (@(posedge clk) disable iff (rst) (~mmu.request) |-> (state[IDLE]))
         else $error("MMU and TLB state mismatch");
+`endif
 
 endmodule

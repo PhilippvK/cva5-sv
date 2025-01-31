@@ -70,7 +70,9 @@ module gc_unit
 
         //Ordering support
         input load_store_status_t load_store_status,
-        input logic [LOG2_MAX_IDS:0] post_issue_count
+        input logic [LOG2_MAX_IDS:0] post_issue_count,
+
+        scaiev_interface.core scaiev
     );
 
     //Largest depth for TLBs
@@ -205,7 +207,7 @@ module gc_unit
             TLB_CLEAR_STATE : if (tlb_clear_done) next_state = IDLE_STATE;
             POST_ISSUE_DRAIN : if (((ifence_in_progress | ret_in_progress) & post_issue_idle) | gc.exception.valid | interrupt_pending) next_state = PRE_ISSUE_FLUSH;
             PRE_ISSUE_FLUSH : next_state = POST_ISSUE_DISCARD;
-            POST_ISSUE_DISCARD : if ((post_issue_count == 0) & load_store_status.no_released_stores_pending) next_state = IDLE_STATE;
+            POST_ISSUE_DISCARD : if ((post_issue_count == 0) & load_store_status.no_released_stores_pending & scaiev.no_writebacks_pending) next_state = IDLE_STATE;
             default : next_state = RST_STATE;
         endcase
     end

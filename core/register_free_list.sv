@@ -86,9 +86,11 @@ module register_free_list
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     fifo_overflow_assertion:
         assert property (@(posedge clk) disable iff (rst) fifo.push |-> (~fifo.full | fifo.pop)) else $error("overflow");
     fifo_underflow_assertion:
         assert property (@(posedge clk) disable iff (rst) fifo.pop |-> fifo.valid) else $error("underflow");
+`endif
 
 endmodule

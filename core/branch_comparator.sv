@@ -75,7 +75,7 @@ module branch_comparator
     //Compressor
     //pairwise reduces carry generation
     always_comb begin
-        foreach(sub_ls_a[i]) begin
+        for (int i = 0; i < $size(sub_ls_a); i++) begin
             sub_ls_a[i] = ((ls_a[2*i] & ls_b[2*i]) & (ls_a[2*i + 1] | ls_b[2*i + 1])) | (ls_a[2*i + 1] & ls_b[2*i + 1]); //carry produced regardless of carry in
             sub_ls_b[i] = ((ls_a[2*i] & ls_b[2*i]) & (ls_a[2*i + 1] | ls_b[2*i + 1])) | (ls_a[2*i + 1] & ls_b[2*i + 1]) |
                 ((ls_a[2*i] | ls_b[2*i]) & (ls_a[2*i + 1] | ls_b[2*i + 1])); // carry produced regardless of carry in OR carry produced if carry in

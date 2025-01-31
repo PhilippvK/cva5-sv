@@ -1,6 +1,8 @@
+core/scaiev_config.sv
 core/cva5_config.sv
 core/riscv_types.sv
 core/csr_types.sv  
+core/scaiev_types.sv
 core/cva5_types.sv  
 l2_arbiter/l2_config_and_types.sv 
 l2_arbiter/l2_interfaces.sv
@@ -68,6 +70,8 @@ core/mmu.sv
 
 core/mul_unit.sv  
 
+core/scaiev_unit.sv
+
 core/ras.sv  
 core/branch_predictor_ram.sv
 core/branch_predictor.sv  
@@ -88,9 +92,12 @@ l2_arbiter/l2_round_robin.sv
 l2_arbiter/l2_arbiter.sv
 core/axi_to_arb.sv  
 
+core/instruction_metadata_and_id_management_vanilla.sv
 core/instruction_metadata_and_id_management.sv
 
 core/l1_arbiter.sv  
 
 core/cva5.sv
+
+core/scaiev_glue.sv
 

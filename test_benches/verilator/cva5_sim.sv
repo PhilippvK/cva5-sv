@@ -22,6 +22,7 @@
 
 module cva5_sim 
 
+    import scaiev_config::*;
     import cva5_config::*;
     import l2_config_and_types::*;
     import riscv_types::*;
@@ -294,7 +295,11 @@ module cva5_sim
     assign data_bram_data_in = data_bram.data_in;
     assign data_bram.data_out = data_bram_data_out;
 
+    scaiev_interface scaiev();
+
     cva5 #(.CONFIG(EXAMPLE_CONFIG)) cpu(.*, .l2(l2[0]));
+
+    scaiev_glue scaiev_glue(.clk(clk),	.rst(rst), .scaiev(scaiev), .WrRD_spawn_issue_addr_o());
 
     //read channel
     logic[3:0] read_counter;
@@ -469,11 +474,29 @@ module cva5_sim
     endgenerate
 
     assign NUM_RETIRE_PORTS = RETIRE_PORTS;
-    generate for (genvar i = 0; i < RETIRE_PORTS; i++) begin
+    /*generate for (genvar i = 0; i < RETIRE_PORTS; i++) begin
         assign retire_ports_pc[i] = cpu.id_block.pc_table[cpu.retire_ids[i]];
         assign retire_ports_instruction[i] = cpu.id_block.instruction_table[cpu.retire_ids[i]];
         assign retire_ports_valid[i] = cpu.retire_port_valid[i];
-    end endgenerate
+    end endgenerate*/
+    generate if (ENABLE_DECODE_INJECT) begin
+         for (genvar i = 0; i < RETIRE_PORTS; i++) begin : retirechk
+             id_t retire_fetch_id;
+             wire has_fetch_id = cpu.id_block.gen_scaiev_injectable.pops_fetch_id[cpu.retire_ids[i]];
+             assign retire_fetch_id = cpu.id_block.gen_scaiev_injectable.pc_fetch_id_translation[cpu.retire_ids[i]];
+             assign retire_ports_pc[i] = cpu.id_block.gen_scaiev_injectable.pc_table[retire_fetch_id];
+             assign retire_ports_instruction[i] = cpu.id_block.gen_scaiev_injectable.instruction_table[retire_fetch_id];
+             assign retire_ports_valid[i] = has_fetch_id && cpu.retire_port_valid[i];
+         end
+     end
+     else begin
+         for (genvar i = 0; i < RETIRE_PORTS; i++) begin
+             assign retire_ports_pc[i] = cpu.id_block.gen_vanilla.id_block_vanilla.pc_table[cpu.retire_ids[i]];
+             assign retire_ports_instruction[i] = cpu.id_block.gen_vanilla.id_block_vanilla.instruction_table[cpu.retire_ids[i]];
+             assign retire_ports_valid[i] = cpu.retire_port_valid[i];
+         end
+     end
+     endgenerate
 
     assign store_queue_empty = cpu.load_store_status.sq_empty;
 

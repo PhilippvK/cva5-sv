@@ -35,6 +35,7 @@ module store_queue
 
         input logic lq_push,
         input logic lq_pop,
+        input logic lq_push_no_conflict, //SCAIE-V
         store_queue_interface.queue sq,
 
         //Address hash (shared by loads and stores)
@@ -46,7 +47,7 @@ module store_queue
         output logic store_conflict,
 
         //Writeback snooping
-        input wb_packet_t wb_snoop,
+        input wb_forward_packet_t wb_snoop,
 
         //Retire
         input id_t retire_ids [RETIRE_PORTS],
@@ -57,14 +58,14 @@ module store_queue
     typedef logic [LOG2_MAX_IDS:0] load_check_count_t;
 
 
-    wb_packet_t wb_snoop_r;
+    wb_forward_packet_t wb_snoop_r;
 
     //Register-based memory blocks
     logic [CONFIG.SQ_DEPTH-1:0] valid;
     logic [CONFIG.SQ_DEPTH-1:0] valid_next;
     addr_hash_t [CONFIG.SQ_DEPTH-1:0] hashes;
     logic [CONFIG.SQ_DEPTH-1:0] released;
-    id_t [CONFIG.SQ_DEPTH-1:0] id_needed;
+    forward_id_t [CONFIG.SQ_DEPTH-1:0] id_needed;
     load_check_count_t [CONFIG.SQ_DEPTH-1:0] load_check_count;
     logic [31:0] store_data_from_wb [CONFIG.SQ_DEPTH];
 
@@ -81,6 +82,7 @@ module store_queue
     logic [LOG2_SQ_DEPTH-1:0] sq_oldest;
 
     logic [CONFIG.SQ_DEPTH-1:0] new_request_one_hot;
+    logic [CONFIG.SQ_DEPTH-1:0] new_request_released_one_hot; //SCAIE-V
     logic [CONFIG.SQ_DEPTH-1:0] issued_one_hot;
 
 
@@ -104,6 +106,9 @@ module store_queue
     end
 
     assign new_request_one_hot = CONFIG.SQ_DEPTH'(sq.push) << sq_index;
+    //Immediately mark new requests from SCAIE-V injected LS as 'released':
+    // The store data from a SCAIE-V instruction is known at this point and does not need to wait for forwarding.
+    assign new_request_released_one_hot = new_request_one_hot & {CONFIG.SQ_DEPTH{sq.data_in.scaiev_meta.is_scaiev}}; //SCAIE-V
     assign issued_one_hot = CONFIG.SQ_DEPTH'(sq.pop) << sq_oldest;
 
     assign valid_next = (valid | new_request_one_hot) & ~issued_one_hot;
@@ -149,7 +154,7 @@ module store_queue
 
     always_comb begin
         for (int i = 0; i < CONFIG.SQ_DEPTH; i++) begin
-            potential_store_conflicts[i] = (valid[i] & ~issued_one_hot[i]) & (addr_hash == hashes[i]);
+            potential_store_conflicts[i] = (valid[i] & ~issued_one_hot[i]) & (addr_hash == hashes[i]) & ~lq_push_no_conflict;
             new_load_waiting[i] = potential_store_conflicts[i] & lq_push;
             waiting_load_completed[i] = prev_store_conflicts[i] & lq_pop;
 
@@ -202,21 +207,44 @@ module store_queue
         end
     end
     always_ff @ (posedge clk) begin
-        released <= (released | newly_released) & ~new_request_one_hot;
+        released <= ((released | newly_released) & ~new_request_one_hot) | new_request_released_one_hot;
     end
 
     assign sq.no_released_stores_pending = ~|(valid & released);
 
     ////////////////////////////////////////////////////
     //Forwarded Store Data
+
+    //SCAIE-V: Wait for forward from decoupled (i.e. out-of-order) writeback.
+    //Stock behaviour of CVA5 is to wait until the store instruction is retired,
+    // which for *in-order* writebacks ensures that everything from before the store is done,
+    // but not for SCAIE-V's decoupled writebacks.
+    logic [CONFIG.SQ_DEPTH-1:0] store_snoop_pending;
+    always_ff @(posedge clk) begin
+        if (wb_snoop_r.valid && !wb_snoop_r.id.is_from_instruction) begin
+            for (int i = 0; i < CONFIG.SQ_DEPTH; i++) begin
+                if (wb_snoop_r.id.id.register_addr == id_needed[i].id.register_addr) begin
+                    store_snoop_pending[i] <= 0;
+                end
+            end
+        end
+        if (sq.push)
+            store_snoop_pending[sq_index] <= sq.data_in.forwarded_store && !sq.data_in.id_needed.is_from_instruction;
+    end
+
     always_ff @ (posedge clk) begin
         wb_snoop_r <= wb_snoop;
     end
 
     always_ff @ (posedge clk) begin
         for (int i = 0; i < CONFIG.SQ_DEPTH; i++) begin
-            if ({1'b0, wb_snoop_r.valid, wb_snoop_r.id} == {released[i], 1'b1, id_needed[i]})
+            if ({1'b0, wb_snoop_r.valid, wb_snoop_r.id.is_from_instruction} == {released[i] && id_needed[i].is_from_instruction, 1'b1, id_needed[i].is_from_instruction}
+                && (wb_snoop_r.id.is_from_instruction
+                   ? wb_snoop_r.id.id.instruction.id == id_needed[i].id.instruction.id
+                   : wb_snoop_r.id.id.register_addr == id_needed[i].id.register_addr
+                )) begin
                 store_data_from_wb[i] <= wb_snoop_r.data;
+            end
         end
     end
     
@@ -243,7 +271,7 @@ module store_queue
         endcase
     end
 
-    assign sq.valid = valid[sq_oldest] & released[sq_oldest];
+    assign sq.valid = valid[sq_oldest] & released[sq_oldest] & ~store_snoop_pending[sq_oldest];
     assign sq.data_out = '{
         addr : output_entry.addr,
         be : output_entry.be,
@@ -258,10 +286,11 @@ module store_queue
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     sq_overflow_assertion:
         assert property (@(posedge clk) disable iff (rst) sq.push |-> (~sq.full | sq.pop)) else $error("sq overflow");
     fifo_underflow_assertion:
         assert property (@(posedge clk) disable iff (rst) sq.pop |-> sq.valid) else $error("sq underflow");
-
+`endif
 
 endmodule

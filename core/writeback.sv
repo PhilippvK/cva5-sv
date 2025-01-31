@@ -40,7 +40,9 @@ module writeback
         //WB output
         output wb_packet_t wb_packet [CONFIG.NUM_WB_GROUPS],
         //Snoop interface (LS unit)
-        output wb_packet_t wb_snoop
+        output wb_forward_packet_t wb_snoop,
+
+        scaiev_interface.core scaiev
     );
 
     //Writeback
@@ -58,7 +60,7 @@ module writeback
 
     function unit_count_t get_cumulative_unit_count();
         unit_count_t counts;
-        int unsigned cumulative_count = 0;
+        automatic int unsigned cumulative_count = 0;
         for (int i = 0; i < CONFIG.NUM_WB_GROUPS; i++) begin
             counts[i] = cumulative_count;
             cumulative_count += NUM_UNITS[i];
@@ -105,11 +107,11 @@ module writeback
             .priority_vector (unit_done[i][NUM_UNITS[i]-1 : 0]),
             .encoded_result (unit_sel[i][NUM_UNITS[i] == 1 ? 0 : ($clog2(NUM_UNITS[i])-1) : 0])
         );
-        assign wb_packet[i].valid = |unit_done[i];
-        assign wb_packet [i].id = unit_instruction_id[i][unit_sel[i]];
+        assign wb_packet[i].valid = (i != 1 || !scaiev.rf_wrReg) & |unit_done[i];
+        assign wb_packet[i].id = unit_instruction_id[i][unit_sel[i]];
         assign wb_packet[i].data = unit_rd[i][unit_sel[i]];
 
-        assign unit_ack[i] = NUM_WB_UNITS'(wb_packet[i].valid) << unit_sel[i];
+        assign unit_ack[i] = (NUM_WB_UNITS'(wb_packet[i].valid) << unit_sel[i]);
     end endgenerate
 
     ////////////////////////////////////////////////////
@@ -122,11 +124,17 @@ module writeback
         if (rst)
             wb_snoop.valid <= 0;
         else
-            wb_snoop.valid <= wb_packet[1].valid;
+            wb_snoop.valid <= scaiev.rf_wrReg || wb_packet[1].valid;
     end
     always_ff @ (posedge clk) begin
-        wb_snoop.data <= wb_packet[1].data;
-        wb_snoop.id <= wb_packet[1].id;
+        wb_snoop.data <= scaiev.rf_wrReg ? scaiev.rf_wrReg_data : wb_packet[1].data;
+        wb_snoop.id.is_from_instruction <= !scaiev.rf_wrReg;
+        wb_snoop.id.id <= 'X;//'{default:'X};
+        if (scaiev.rf_wrReg)
+            wb_snoop.id.id.register_addr <= scaiev.rf_wrReg_phys_RD;
+        else
+            wb_snoop.id.id.instruction.id <= wb_packet[1].id;
+        //wb_snoop.id <= wb_packet[1].id;
     end
 
     ////////////////////////////////////////////////////

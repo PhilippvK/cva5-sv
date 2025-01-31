@@ -22,6 +22,7 @@
 
 module register_file
 
+    import scaiev_config::*;
     import cva5_config::*;
     import riscv_types::*;
     import cva5_types::*;
@@ -41,12 +42,15 @@ module register_file
         input phys_addr_t decode_phys_rd_addr,
         input logic decode_advance,
         input logic decode_uses_rd,
+        input logic decode_uses_rd_decoupled,
 
         //Issue interface
         register_file_issue_interface.register_file rf_issue,
 
         //Writeback
-        input commit_packet_t commit [CONFIG.NUM_WB_GROUPS]
+        input commit_packet_t commit [CONFIG.NUM_WB_GROUPS],
+
+        scaiev_interface.core scaiev
     );
     typedef logic [31:0] rs_data_set_t [REGFILE_READ_PORTS];
     rs_data_set_t rs_data_set [CONFIG.NUM_WB_GROUPS];
@@ -63,6 +67,26 @@ module register_file
     //toggle ports: decode advance, single-cycle/fetch_flush, multi-cycle commit
     //read ports: rs-decode, rs-issue
 
+    logic [$clog2(64)-1:0] read_addr_for_toggle_mem_set [REGFILE_READ_PORTS*2];
+    assign read_addr_for_toggle_mem_set[0] = decode_phys_rs_addr[RS1];
+    assign read_addr_for_toggle_mem_set[1] = decode_phys_rs_addr[RS2];
+    assign read_addr_for_toggle_mem_set[2] = rf_issue.phys_rs_addr[RS1];
+    assign read_addr_for_toggle_mem_set[3] = rf_issue.phys_rs_addr[RS2];
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign read_addr_for_toggle_mem_set[4] = decode_phys_rs_addr[RD_AS_RS];
+        assign read_addr_for_toggle_mem_set[5] = rf_issue.phys_rs_addr[RD_AS_RS];
+    end
+
+    logic id_inuse_from_toggle_mem_set [REGFILE_READ_PORTS*2];
+    assign decode_inuse[RS1] = id_inuse_from_toggle_mem_set[0];
+    assign decode_inuse[RS2] = id_inuse_from_toggle_mem_set[1];
+    assign rf_issue.inuse[RS1] = id_inuse_from_toggle_mem_set[2];
+    assign rf_issue.inuse[RS2] = id_inuse_from_toggle_mem_set[3];
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign decode_inuse[RD_AS_RS] = id_inuse_from_toggle_mem_set[4];
+        assign rf_issue.inuse[RD_AS_RS] = id_inuse_from_toggle_mem_set[5];
+    end
+
     toggle_memory_set # (
         .DEPTH (64),
         .NUM_WRITE_PORTS (3),
@@ -75,7 +99,7 @@ module register_file
         .rst (rst),
         .init_clear (gc.init_clear),
         .toggle ('{
-            (decode_advance & decode_uses_rd & |decode_phys_rd_addr & ~gc.fetch_flush),
+            (decode_advance & (decode_uses_rd | decode_uses_rd_decoupled) & |decode_phys_rd_addr & ~(gc.fetch_flush | scaiev.issue_flush | scaiev.decode_flush)),
             rf_issue.single_cycle_or_flush,
             commit[1].valid
         }),
@@ -84,18 +108,8 @@ module register_file
             rf_issue.phys_rd_addr, 
             commit[1].phys_addr
         }),
-        .read_addr ('{
-            decode_phys_rs_addr[RS1], 
-            decode_phys_rs_addr[RS2], 
-            rf_issue.phys_rs_addr[RS1], 
-            rf_issue.phys_rs_addr[RS2]
-        }),
-        .in_use ('{
-            decode_inuse[RS1],
-            decode_inuse[RS2],
-            rf_issue.inuse[RS1],
-            rf_issue.inuse[RS2]
-        })
+        .read_addr (read_addr_for_toggle_mem_set),
+        .in_use (id_inuse_from_toggle_mem_set)
     );
     always_ff @ (posedge clk) begin
         if (decode_advance)
@@ -137,8 +151,10 @@ module register_file
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     for (genvar i = 0; i < CONFIG.NUM_WB_GROUPS; i++) begin : write_to_rd_zero_assertion
         assert property (@(posedge clk) disable iff (rst) (commit[i].valid) |-> (commit[i].phys_addr != 0)) else $error("write to register zero");
     end
+`endif
 
 endmodule

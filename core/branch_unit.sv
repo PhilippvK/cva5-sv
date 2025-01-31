@@ -104,7 +104,8 @@ module branch_unit
         if (issue.new_request) begin
             branch_taken_ex <= branch_taken;
             new_pc_ex <= {new_pc[31:1], new_pc[0]  & ~branch_inputs.jalr};
-            id_ex <= issue.id;
+            //id_ex <= issue.id;
+            id_ex <= branch_inputs.pc_id;
             jal_jalr_ex <= branch_inputs.jal_jalr;
         end
     end

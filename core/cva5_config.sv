@@ -21,6 +21,7 @@
  */
 
 package cva5_config;
+    import scaiev_config::*;
 
     ////////////////////////////////////////////////////
     //Vendor Selection
@@ -106,6 +107,7 @@ package cva5_config;
         bit INCLUDE_U_MODE;
         bit INCLUDE_MUL;
         bit INCLUDE_DIV;
+        bit INCLUDE_SCAIEV; //SCAIE-V
         bit INCLUDE_IFENCE; //local mem operations only
         bit INCLUDE_CSRS;
         bit INCLUDE_AMO; //cache operations only
@@ -159,6 +161,7 @@ package cva5_config;
         INCLUDE_U_MODE : 1,
         INCLUDE_MUL : 1,
         INCLUDE_DIV : 1,
+        INCLUDE_SCAIEV : 1,
         INCLUDE_IFENCE : 1,
         INCLUDE_CSRS : 1,
         INCLUDE_AMO : 0,
@@ -167,7 +170,7 @@ package cva5_config;
             MACHINE_IMPLEMENTATION_ID : 0,
             CPU_ID : 0,
             RESET_VEC : 32'h80000000,
-            RESET_MTVEC : 32'h80000100,
+            RESET_MTVEC : 32'h8F000000,
             NON_STANDARD_OPTIONS : '{
                 COUNTER_W : 33,
                 MCYCLE_WRITEABLE : 1,
@@ -222,20 +225,20 @@ package cva5_config;
         },
         INCLUDE_ILOCAL_MEM : 1,
         ILOCAL_MEM_ADDR : '{
-            L : 32'h80000000, 
-            H : 32'h8FFFFFFF
+            L : 32'h80000000, //For CVA5 testbenches: 80000000
+            H : 32'h8FFFFFFF  //For CVA5 testbenches: 8FFFFFFF
         },
         INCLUDE_DLOCAL_MEM : 1,
         DLOCAL_MEM_ADDR : '{
-            L : 32'h80000000,
-            H : 32'h8FFFFFFF
+            L : 32'h80000000, //For CVA5 testbenches: 80000000
+            H : 32'h8FFFFFFF  //For CVA5 testbenches: 8FFFFFFF
         },
         INCLUDE_IBUS : 0,
         IBUS_ADDR : '{
             L : 32'h60000000, 
             H : 32'h6FFFFFFF
         },
-        INCLUDE_PERIPHERAL_BUS : 1,
+        INCLUDE_PERIPHERAL_BUS : 1, //Set to 1 for CVA5 testbenches
         PERIPHERAL_BUS_ADDR : '{
             L : 32'h60000000,
             H : 32'h6FFFFFFF
@@ -260,6 +263,7 @@ package cva5_config;
         int unsigned CSR;
         int unsigned MUL;
         int unsigned DIV;
+        int unsigned SCAIEV; //SCAIE-V
         int unsigned BR;
         int unsigned IEC;
     } unit_id_param_t;
@@ -270,8 +274,9 @@ package cva5_config;
         CSR : 2,
         MUL : 3,
         DIV : 4,
-        BR : 5,
-        IEC : 6
+        SCAIEV : 5, //SCAIE-V
+        BR : 6,
+        IEC : 7
     };
 
     ////////////////////////////////////////////////////
@@ -287,10 +292,11 @@ package cva5_config;
     ////////////////////////////////////////////////////
     //Number of commit ports
     localparam RETIRE_PORTS = 2; //min 1. (Non-powers of two supported) > 1 is recommended to allow stores to commit sooner
-    localparam REGFILE_READ_PORTS = 2; //min 2, for RS1 and RS2. (Non-powers of two supported)
-    typedef enum bit {
+    localparam REGFILE_READ_PORTS = ENABLE_NATIVE_RD_AS_RS ? 3 : 2; //min 2, for RS1 and RS2. (Non-powers of two supported)
+    typedef enum bit [1:0] {
         RS1 = 0,
-        RS2 = 1
+        RS2 = 1,
+        RD_AS_RS = 2
     } rs1_index_t;
 
 

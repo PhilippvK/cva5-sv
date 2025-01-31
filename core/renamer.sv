@@ -22,6 +22,7 @@
 
 module renamer
 
+    import scaiev_config::*;
     import cva5_config::*;
     import riscv_types::*;
     import cva5_types::*;
@@ -38,13 +39,18 @@ module renamer
         //Decode
         input logic decode_advance,
         renamer_interface.renamer decode,
+        input logic decode_uses_rd_decoupled, //SCAIE-V
 
         //Issue stage
         input issue_packet_t issue,
         input logic instruction_issued_with_rd,
+        input logic issue_uses_rd_decoupled, //SCAIE-V
 
         //Retire response
-        input retire_packet_t retire
+        input retire_packet_t retire,
+
+        //SCAIE-V
+        scaiev_interface.core scaiev
     );
     //////////////////////////////////////////
     typedef struct packed{
@@ -69,10 +75,10 @@ module renamer
     //Zero register is never renamed
     //If a renamed destination is flushed in the issue stage, state is rolled back
     //When an instruction reaches the retire stage it either commits or reverts its renaming depending on whether the instruction retires or is discarded
-    assign rename_valid = (~gc.fetch_flush) & decode_advance & decode.uses_rd & |decode.rd_addr;
+    assign rename_valid = (~gc.fetch_flush) & (~scaiev.issue_flush) & (~scaiev.decode_flush) & decode_advance & (decode.uses_rd | decode_uses_rd_decoupled) & |decode.rd_addr;
 
     //Revert physcial address assignment on a flush
-    assign rollback = gc.fetch_flush & issue.stage_valid & issue.uses_rd & |issue.rd_addr;
+    assign rollback = (gc.fetch_flush | scaiev.issue_flush) & issue.stage_valid & (issue.uses_rd | issue_uses_rd_decoupled) & |issue.rd_addr;
 
     //counter for indexing through memories for post-reset clearing/initialization
     lfsr #(.WIDTH(6), .NEEDS_RESET(0))
@@ -92,11 +98,24 @@ module renamer
     );
 
     //During post reset init, initialize FIFO with free list (registers 32-63)
-    assign free_list.potential_push = (gc.init_clear & ~clear_index[5]) | (retire.valid);
-    assign free_list.push = free_list.potential_push;
+    assign free_list.potential_push = (gc.init_clear & ~clear_index[5]) | (retire.valid) | (scaiev.rf_wrReg);
+    assign free_list.push = free_list.potential_push && !scaiev.renamer_addtofree_skip;
 
-    assign free_list.data_in = gc.init_clear ? {1'b1, clear_index[4:0]} : (gc.writeback_supress ? inuse_list_output.spec_phys_addr : inuse_list_output.previous_phys_addr);
+    phys_addr_t freed_phys_addr;
+    always_comb begin
+        if (gc.init_clear)
+            freed_phys_addr = {1'b1, clear_index[4:0]};
+        else if (scaiev.rf_wrReg && !retire.valid) //TODO: Consider exceptions that should suppress the decoupled writeback.
+            freed_phys_addr = scaiev.rf_wrReg_prev_phys_RD[5:0];
+        else
+            freed_phys_addr = gc.writeback_supress ? inuse_list_output.spec_phys_addr : inuse_list_output.previous_phys_addr;
+    end
+
+    assign free_list.data_in = freed_phys_addr;
     assign free_list.pop = rename_valid;
+
+    assign scaiev.renamer_addtofree_valid = free_list.potential_push;
+    assign scaiev.renamer_addtofree_reg = freed_phys_addr;
 
     ////////////////////////////////////////////////////
     //Inuse list FIFO
@@ -111,12 +130,11 @@ module renamer
 
     assign inuse_list_input.rd_addr = issue.rd_addr;
     assign inuse_list_input.spec_phys_addr = issue.phys_rd_addr;
-    assign inuse_list_input.previous_phys_addr = spec_table_previous_r.phys_addr;
-    assign inuse_list_input.previous_wb_group = spec_table_previous_r.wb_group;
     assign inuse_list.data_in = inuse_list_input;
 
     assign inuse_list_output = inuse_list.data_out;
     assign inuse_list.pop = retire.valid;
+
 
     ////////////////////////////////////////////////////
     //Speculative rd-to-phys Table
@@ -133,6 +151,11 @@ module renamer
     spec_table_t spec_table_next_mux [4];
     spec_table_t spec_table_previous;
     spec_table_t spec_table_previous_r;
+    
+    assign inuse_list_input.previous_phys_addr = spec_table_previous_r.phys_addr;
+    assign inuse_list_input.previous_wb_group = spec_table_previous_r.wb_group;
+    
+    assign scaiev.issue_prev_phys_RD_decoupled = {spec_table_previous_r.wb_group, spec_table_previous_r.phys_addr};
 
     logic spec_table_update;
     rs_addr_t spec_table_write_index;
@@ -168,7 +191,10 @@ module renamer
     assign spec_table_next = spec_table_next_mux[spec_table_sel];
 
     assign spec_table_read_addr[0] = spec_table_write_index;
-    assign spec_table_read_addr[1:REGFILE_READ_PORTS] = '{decode.rs_addr[RS1], decode.rs_addr[RS2]};
+    assign spec_table_read_addr[1:2] = '{decode.rs_addr[RS1], decode.rs_addr[RS2]};
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign spec_table_read_addr[3] = decode.rs_addr[RD_AS_RS];
+    end
 
     lutram_1w_mr #(
         .WIDTH($bits(spec_table_t)),
@@ -207,11 +233,13 @@ module renamer
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     rename_rd_zero_assertion:
         assert property (@(posedge clk) disable iff (rst) (decode.rd_addr == 0) |-> (decode.phys_rd_addr == 0)) else $error("rd zero renamed");
 
     for (genvar i = 0; i < REGFILE_READ_PORTS; i++) begin : rename_rs_zero_assertion
         assert property (@(posedge clk) disable iff (rst) (decode.rs_addr[i] == 0) |-> (decode.phys_rs_addr[i] == 0)) else $error("rs zero renamed");
     end
+`endif
 
 endmodule

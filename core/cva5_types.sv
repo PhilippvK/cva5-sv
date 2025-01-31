@@ -21,9 +21,11 @@
  */
 
 package cva5_types;
+    import scaiev_config::*;
     import cva5_config::*;
     import riscv_types::*;
     import csr_types::*;
+    import scaiev_types::*;
 
     localparam LOG2_RETIRE_PORTS = $clog2(RETIRE_PORTS);
     localparam LOG2_MAX_IDS = $clog2(MAX_IDS);
@@ -63,6 +65,7 @@ package cva5_types;
 
     typedef struct packed{
         id_t id;
+        id_t pc_id; //Pre-Decode
         logic [31:0] pc;
         logic [31:0] instruction;
         logic valid;
@@ -81,6 +84,7 @@ package cva5_types;
         logic uses_rd;
         logic is_multicycle;
         id_t id;
+        id_t pc_id; //Pre-Decode
         exception_sources_t exception_unit;
         logic stage_valid;
         fetch_metadata_t fetch_metadata;
@@ -100,6 +104,7 @@ package cva5_types;
     } alu_inputs_t;
 
     typedef struct packed {
+        id_t pc_id;
         logic [XLEN:0] rs1;
         logic [XLEN:0] rs2;
         logic [31:0] pc_p4;
@@ -138,6 +143,17 @@ package cva5_types;
         logic [4:0] op;
     } amo_details_t;
 
+    typedef struct packed{ //quite ugly, but tagged unions appear to lack tool support
+        logic is_from_instruction;
+        union packed {
+            struct packed {
+                id_t id; //ID of instruction to forward the store from.
+                logic [$bits(phys_addr_t)-$bits(id_t)-1:0] pad;
+            } instruction;
+            phys_addr_t register_addr; //Address of physical register to listen for (SCAIE-V decoupled writeback).
+        } id;
+    } forward_id_t;
+
     typedef struct packed{
         logic [XLEN-1:0] rs1;
         logic [XLEN-1:0] rs2;
@@ -145,9 +161,10 @@ package cva5_types;
         logic [2:0] fn3;
         logic load;
         logic store;
+        logic relaxed_load_ordering; //SCAIE-V: Support out-of-pipeline loads ignoring in-order store conflicts
         logic fence;
         logic forwarded_store;
-        id_t store_forward_id;
+        forward_id_t store_forward_id;
         //amo support
         amo_details_t amo;
     } load_store_inputs_t;
@@ -184,12 +201,14 @@ package cva5_types;
         logic [31:0] addr;
         logic load;
         logic store;
+        logic relaxed_load_ordering; //SCAIE-V: Support out-of-pipeline loads ignoring in-order store conflicts
         logic [3:0] be;
         logic [2:0] fn3;
         logic [31:0] data;
         id_t id;
+        scaiev_ls_meta_t scaiev_meta;
         logic forwarded_store;
-        id_t id_needed;
+        forward_id_t id_needed;
     } lsq_entry_t;
 
     typedef struct packed {
@@ -205,6 +224,12 @@ package cva5_types;
         logic no_released_stores_pending;
         logic idle;
     } load_store_status_t;
+
+    typedef struct packed{
+        forward_id_t id;
+        logic valid;
+        logic [31:0] data;
+    } wb_forward_packet_t;
 
     typedef struct packed{
         id_t id;
@@ -233,6 +258,7 @@ package cva5_types;
         logic [2:0] fn3;
         logic [31:0] data_in;
         id_t id;
+        scaiev_ls_meta_t scaiev_meta;
     } data_access_shared_inputs_t;
 
     typedef enum  {

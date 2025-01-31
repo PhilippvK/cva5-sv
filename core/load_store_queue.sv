@@ -25,6 +25,7 @@ module load_store_queue //ID-based input buffer for Load/Store Unit
     import cva5_config::*;
     import riscv_types::*;
     import cva5_types::*;
+    import scaiev_types::*;
 
     # (
         parameter cpu_config_t CONFIG = EXAMPLE_CONFIG
@@ -36,7 +37,7 @@ module load_store_queue //ID-based input buffer for Load/Store Unit
 
         load_store_queue_interface.queue lsq,
         //Writeback snooping
-        input wb_packet_t wb_snoop,
+        input wb_forward_packet_t wb_snoop,
 
         //Retire release
         input id_t retire_ids [RETIRE_PORTS],
@@ -49,6 +50,7 @@ module load_store_queue //ID-based input buffer for Load/Store Unit
         logic [31:0] addr;
         logic [2:0] fn3;
         id_t id;
+        scaiev_ls_meta_t scaiev_meta; //SCAIE-V
         logic [CONFIG.SQ_DEPTH-1:0] potential_store_conflicts;
     } lq_entry_t;
 
@@ -91,11 +93,17 @@ module load_store_queue //ID-based input buffer for Load/Store Unit
     assign lq.potential_push = lsq.potential_push;
     assign lq.pop = lsq.pop & load_selected;
 
+    //SCAIE-V
+    //Disable l/s conflict detection for loads issued through the out-of-pipeline SCAIE-V path.
+    // -> Only register hazards need to be taken care of. Handling l/s ordering, deadlocks could occur.
+    wire sv_load_order_irrelevant = lsq.data_in.relaxed_load_ordering;
+
     //FIFO data ports
     assign lq_data_in = '{
         addr : lsq.data_in.addr,
         fn3 : lsq.data_in.fn3,
         id : lsq.data_in.id, 
+        scaiev_meta : lsq.data_in.scaiev_meta, //SCAIE-V
         potential_store_conflicts : potential_store_conflicts
     };
     assign lq.data_in = lq_data_in;
@@ -111,6 +119,7 @@ module load_store_queue //ID-based input buffer for Load/Store Unit
         .rst (rst | gc.sq_flush),
         .lq_push (lq.push),
         .lq_pop (lq.pop),
+        .lq_push_no_conflict (sv_load_order_irrelevant), //SCAIE-V
         .sq (sq),
         .addr_hash (addr_hash),
         .potential_store_conflicts (potential_store_conflicts),
@@ -135,7 +144,8 @@ module load_store_queue //ID-based input buffer for Load/Store Unit
         be : load_selected ? '0 : sq.data_out.be,
         fn3 : load_selected ? lq_data_out.fn3 : sq.data_out.fn3,
         data_in : sq.data_out.data,
-        id : lq_data_out.id
+        id : lq_data_out.id,
+        scaiev_meta : lq_data_out.scaiev_meta //SCAIE-V
     };
 
     assign lsq.sq_empty = sq.empty;

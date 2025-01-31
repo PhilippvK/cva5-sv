@@ -62,8 +62,10 @@ module register_bank
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     write_to_zero_reg_assertion:
         assert property (@(posedge clk) disable iff (rst) !(commit & write_addr == 0))
         else $error("Write to zero reg occured!");
+`endif
 
 endmodule

@@ -25,6 +25,7 @@ module load_store_unit
     import cva5_config::*;
     import riscv_types::*;
     import cva5_types::*;
+    import scaiev_types::*;
 
     # (
         parameter cpu_config_t CONFIG = EXAMPLE_CONFIG
@@ -37,6 +38,7 @@ module load_store_unit
 
         input load_store_inputs_t ls_inputs,
         unit_issue_interface.unit issue,
+        input scaiev_ls_meta_t issue_scaiev_meta, //SCAIE-V: For LSU requests from ISAX
 
         input logic dcache_on,
         input logic clear_reservation,
@@ -55,7 +57,7 @@ module load_store_unit
         local_memory_interface.master data_bram,
 
         //Writeback-Store Interface
-        input wb_packet_t wb_snoop,
+        input wb_forward_packet_t wb_snoop,
 
         //Retire release
         input id_t retire_ids [RETIRE_PORTS],
@@ -64,6 +66,7 @@ module load_store_unit
         exception_interface.unit exception,
         output load_store_status_t load_store_status,
         unit_writeback_interface.unit wb,
+        output scaiev_ls_meta_t wb_scaiev_meta, //SCAIE-V
 
         output logic tr_load_conflict_delay
     );
@@ -121,6 +124,7 @@ module load_store_unit
         logic [1:0] byte_addr;
         logic [1:0] final_mux_sel;
         id_t id;
+        scaiev_ls_meta_t scaiev_meta;
         logic [NUM_SUB_UNITS_W-1:0] subunit_id;
     } load_attributes_t;
     load_attributes_t  mem_attr, wb_attr;
@@ -217,7 +221,9 @@ module load_store_unit
         data : ls_inputs.rs2,
         load : ls_inputs.load,
         store : ls_inputs.store,
+        relaxed_load_ordering : ls_inputs.relaxed_load_ordering,
         id : issue.id,
+        scaiev_meta : issue_scaiev_meta, //SCAIE-V
         forwarded_store : ls_inputs.forwarded_store,
         id_needed : ls_inputs.store_forward_id
     };
@@ -295,6 +301,7 @@ module load_store_unit
         byte_addr : shared_inputs.addr[1:0],
         final_mux_sel : final_mux_sel,
         id : shared_inputs.id,
+        scaiev_meta : shared_inputs.scaiev_meta, //SCAIE-V
         subunit_id : subunit_id
     };
 
@@ -419,6 +426,7 @@ module load_store_unit
     assign wb.rd = final_load_data;
     assign wb.done = load_complete | load_exception_complete;
     assign wb.id = load_exception_complete ? exception.id : wb_attr.id;
+    assign wb_scaiev_meta = load_exception_complete ? 0 : wb_attr.scaiev_meta; //SCAIE-V
 
     ////////////////////////////////////////////////////
     //End of Implementation
@@ -426,6 +434,7 @@ module load_store_unit
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     spurious_load_complete_assertion:
         assert property (@(posedge clk) disable iff (rst) load_complete |-> (load_attributes.valid && unit_data_valid[wb_attr.subunit_id]))
         else $error("Spurious load complete detected!");
@@ -435,6 +444,7 @@ module load_store_unit
     //         assert property (@(posedge clk) disable iff (rst) (sub_unit_issue & ~ls_inputs.fence) |-> |sub_unit_address_match)
     //         else $error("invalid L/S address");
     // `endif
+`endif
 
     ////////////////////////////////////////////////////
     //Trace Interface

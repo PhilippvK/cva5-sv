@@ -36,6 +36,7 @@ module fetch
 
         input logic branch_flush,
         input gc_outputs_t gc,
+        scaiev_interface.core scaiev,
         input logic tlb_on,
         input logic exception,
 
@@ -109,12 +110,15 @@ module fetch
     logic [31:0] pc_plus_4;
     logic [31:0] pc_mux [4];
     logic [1:0] pc_sel;
+    logic [31:0] next_pc_prescaiev;
     logic [31:0] next_pc;
+    logic [31:0] pc_prescaiev;
     logic [31:0] pc;
 
     logic flush_or_rst;
     fifo_interface #(.DATA_WIDTH($bits(fetch_attributes_t))) fetch_attr_fifo();
 
+    logic update_pc_prescaiev;
     logic update_pc;
     logic new_mem_request;
     logic exception_pending;
@@ -122,19 +126,24 @@ module fetch
 
     logic [31:0] translated_address;
 
+    logic scaiev_full_fetch_flush;
+
     genvar i;
     ////////////////////////////////////////////////////
     //Implementation
     ////////////////////////////////////////////////////
+    assign scaiev_full_fetch_flush = scaiev.decode_flush | scaiev.issue_flush;
     //Fetch PC
-    assign update_pc = new_mem_request | gc.fetch_flush | early_branch_flush;
+    assign update_pc_prescaiev = new_mem_request | gc.fetch_flush | early_branch_flush | scaiev_full_fetch_flush | scaiev.fetch_flush;
+    assign update_pc = update_pc_prescaiev;
     always_ff @(posedge clk) begin
         if (gc.init_clear)
-            pc <= CONFIG.CSRS.RESET_VEC;
+            pc_prescaiev <= CONFIG.CSRS.RESET_VEC;
         else if (update_pc)
-            pc <= {next_pc[31:2], 2'b0};
+            pc_prescaiev <= {next_pc[31:2], 2'b0};
     end
 
+    assign pc = pc_prescaiev;//scaiev.fetch_wrPCValid ? scaiev.fetch_wrPC : pc_prescaiev;
     assign pc_plus_4 = pc + 4;
 
     priority_encoder #(.WIDTH(4))
@@ -146,7 +155,10 @@ module fetch
     assign pc_mux[1] = bp.branch_flush_pc;
     assign pc_mux[2] = bp.is_return ? ras.addr : bp.predicted_pc;
     assign pc_mux[3] = pc_plus_4;
-    assign next_pc = pc_mux[pc_sel];
+    assign next_pc_prescaiev = pc_mux[pc_sel];
+    assign next_pc = scaiev.fetch_wrPCValid ? scaiev.fetch_wrPC : next_pc_prescaiev;//next_pc_prescaiev;//
+    assign scaiev.pre_fetch_PC = next_pc_prescaiev;
+    assign scaiev.pre_fetch_isStalling = ~update_pc;
 
     //If an exception occurs here in the fetch logic,
     //hold the fetching of data from memory until the status of the
@@ -158,8 +170,8 @@ module fetch
             exception_pending <= 1;
     end
 
-    assign bp.new_mem_request = update_pc;
-    assign bp.next_pc = next_pc;
+    assign bp.new_mem_request = update_pc_prescaiev;
+    assign bp.next_pc = next_pc_prescaiev;
     assign bp.if_pc = pc;
     assign bp.pc_id = pc_id;
     assign bp.pc_id_assigned = pc_id_assigned;
@@ -179,10 +191,15 @@ module fetch
 
     //////////////////////////////////////////////
     //Issue Control Signals
-    assign flush_or_rst = (rst | gc.fetch_flush | early_branch_flush);
+    assign flush_or_rst = (rst | gc.fetch_flush | early_branch_flush | scaiev_full_fetch_flush);
 
-    assign new_mem_request = (~tlb_on | tlb.done) & pc_id_available & ~fetch_attr_fifo.full & units_ready & (~gc.fetch_hold) & (~exception_pending);
+    logic new_mem_request_prescaiev;
+    assign new_mem_request_prescaiev = (~tlb_on | tlb.done) & pc_id_available & ~fetch_attr_fifo.full & units_ready & (~gc.fetch_hold) & (~exception_pending);
+    assign new_mem_request = new_mem_request_prescaiev & ~(scaiev.fetch_flush | scaiev.fetch_stall);
     assign pc_id_assigned = new_mem_request | tlb.is_fault;
+    assign scaiev.fetch_PC = pc;
+    assign scaiev.fetch_valid = new_mem_request_prescaiev | tlb.is_fault;
+    assign scaiev.fetch_isStalling = ~new_mem_request_prescaiev;
 
     //////////////////////////////////////////////
     //Subunit Tracking
@@ -221,7 +238,7 @@ module fetch
     always_ff @(posedge clk) begin
         if (rst)
             flush_count <= 0;
-        else if (gc.fetch_flush)
+        else if (gc.fetch_flush | scaiev_full_fetch_flush | early_branch_flush)
             flush_count <= inflight_count_next;
         else if (|flush_count & fetch_attr_fifo.pop)
             flush_count <= flush_count - 1;
@@ -317,8 +334,10 @@ module fetch
 
     ////////////////////////////////////////////////////
     //Assertions
+`ifndef DISABLE_ASSERT_PROPERTY
     spurious_fetch_complete_assertion:
         assert property (@(posedge clk) disable iff (rst) (|unit_data_valid) |-> (fetch_attr_fifo.valid && unit_data_valid[fetch_attr.subunit_id]))
         else $error("Spurious fetch complete detected!");
+`endif
 
 endmodule

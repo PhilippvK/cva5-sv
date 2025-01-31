@@ -22,9 +22,11 @@
 
 module decode_and_issue
 
+    import scaiev_config::*;
     import cva5_config::*;
     import riscv_types::*;
     import cva5_types::*;
+    import scaiev_types::*;
     import csr_types::*;
 
     # (
@@ -39,6 +41,10 @@ module decode_and_issue
 
         //ID Management
         input logic pc_id_available,
+        input logic pc_inject_id_available, //SCAIE-V
+        output logic pc_inject_id_assigned, //SCAIE-V
+        output logic pc_inject_keep_for_repeat, //SCAIE-V
+        output logic pc_inject_is_repeat, //SCAIE-V
         input decode_packet_t decode,
         output logic decode_advance,
         output exception_sources_t decode_exception_unit,
@@ -47,6 +53,8 @@ module decode_and_issue
         renamer_interface.decode renamer,
 
         output logic decode_uses_rd,
+        output logic decode_uses_rd_decoupled, //SCAIE-V
+        output logic issue_uses_rd_decoupled, //SCAIE-V
         output rs_addr_t decode_rd_addr,
         output phys_addr_t decode_phys_rd_addr,
         output phys_addr_t decode_phys_rs_addr [REGFILE_READ_PORTS],
@@ -66,9 +74,13 @@ module decode_and_issue
         output csr_inputs_t csr_inputs,
         output mul_inputs_t mul_inputs,
         output div_inputs_t div_inputs,
+        output scaiev_inputs_t scaiev_inputs, //SCAIE-V
+        input logic scaiev_stall_issue, //SCAIE-V
 
         unit_issue_interface.decode unit_issue [NUM_UNITS-1:0],
 
+        scaiev_interface.core scaiev,
+        output logic scaiev_decode_inject,
         input gc_outputs_t gc,
         input logic [1:0] current_privilege,
 
@@ -98,6 +110,7 @@ module decode_and_issue
         output logic [31:0] tr_instruction_data_dec
         );
 
+    logic [31:0] selected_instruction; //SCAIE-V
     logic [2:0] fn3;
     logic [6:0] opcode;
     logic [4:0] opcode_trim;
@@ -114,6 +127,21 @@ module decode_and_issue
     logic csr_imm_op;
     logic environment_op;
 
+    logic is_scaiev_isax; //SCAIE-V
+    logic is_scaiev_isax_stdencoding; //SCAIE-V
+    logic scaiev_uses_rs1;
+    logic scaiev_uses_rs2;
+    logic scaiev_uses_rd_as_rs;
+    logic scaiev_uses_rd;
+    logic scaiev_uses_rd_decoupled;
+
+    logic stall_rd_decoupled; //SCAIE-V
+
+    logic decode_valid; //SCAIE-V
+    logic decode_cur_is_repeat; //SCAIE-V
+
+    logic issue_valid_or_waiting_for_operands;
+    logic issue_valid_prescaiev;
     logic issue_valid;
     logic operands_ready;
     logic mult_div_op;
@@ -128,8 +156,10 @@ module decode_and_issue
     phys_addr_t issue_phys_rs_addr [REGFILE_READ_PORTS];
     logic [$clog2(CONFIG.NUM_WB_GROUPS)-1:0] issue_rs_wb_group [REGFILE_READ_PORTS];
     logic issue_uses_rs [REGFILE_READ_PORTS];
+    logic issue_is_injected; //SCAIE-V
 
     logic pre_issue_exception_pending;
+    logic illegal_instruction_pattern_prescaiev;
     logic illegal_instruction_pattern;
 
     logic issue_stage_ready;
@@ -139,50 +169,159 @@ module decode_and_issue
     genvar i;
     ////////////////////////////////////////////////////
     //Implementation
+    //SCAIE-V: Inject a pseudo-instruction for arbitrary register reads and writebacks.
+    // -> Use AUIPC opcode, but add additional MUXes to allow register reads 
+    assign scaiev_decode_inject = scaiev.decode_wrReg || scaiev.decode_rdReg;
+    assign selected_instruction = {
+        decode.instruction[31:25],
+        decode.instruction[24:20], //rs2
+        decode.instruction[19:15], //rs1
+        decode.instruction[14:12], //fn3
+        decode.instruction[11:7], //rd
+        (!scaiev_decode_inject) ? decode.instruction[6:0] : {AUIPC_T, 2'b11} //opcode
+    };
+    assign pc_inject_id_assigned = (scaiev_decode_inject || decode_cur_is_repeat) & pc_inject_id_available & issue_stage_ready & ~scaiev.decode_stall;
+    assign decode_valid = (scaiev_decode_inject || decode_cur_is_repeat) ? pc_inject_id_available : decode.valid;
     
     //Can move data into issue stage if:
     // there is no instruction currently in the issue stage, or
     // an instruction could issue (issue_flush, issue_hold and whether the instruction is valid are not needed in this check)
     assign issue_stage_ready = ((~issue.stage_valid) | (issue_valid & |issue_ready)) & ~gc.issue_hold;
-    assign decode_advance = decode.valid & issue_stage_ready;
+    assign decode_advance = decode_valid & issue_stage_ready & ~scaiev.decode_stall & ~(scaiev_uses_rd_decoupled & stall_rd_decoupled);
 
     //Instruction aliases
-    assign opcode = decode.instruction[6:0];
+    assign opcode = selected_instruction[6:0];
     assign opcode_trim = opcode[6:2];
-    assign fn3 = decode.instruction[14:12];
-    assign rs_addr[RS1] = decode.instruction[19:15];
-    assign rs_addr[RS2] = decode.instruction[24:20];
-    assign rd_addr = decode.instruction[11:7];
+    assign fn3 = selected_instruction[14:12];
+    assign rs_addr[RS1] = (!scaiev_decode_inject && !scaiev.decode_RS1_override) ? selected_instruction[19:15] : scaiev.decode_rdReg_RS1;
+    assign rs_addr[RS2] = (!scaiev_decode_inject && !scaiev.decode_RS2_override) ? selected_instruction[24:20] : scaiev.decode_rdReg_RS2;
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign rs_addr[RD_AS_RS] = (!scaiev_decode_inject && !scaiev.decode_RD_AS_RS_override) ? selected_instruction[11:7] : scaiev.decode_rdReg_RD_AS_RS;
+    end
+    assign rd_addr = (!scaiev_decode_inject) ? selected_instruction[11:7] : (scaiev.decode_wrReg ? scaiev.decode_wrReg_RD : 5'b0);
 
     assign is_csr = CONFIG.INCLUDE_CSRS & (opcode_trim == SYSTEM_T) & (fn3 != 0);
     assign is_fence = (opcode_trim == FENCE_T) & ~fn3[0];
     assign is_ifence = CONFIG.INCLUDE_IFENCE & (opcode_trim == FENCE_T) & fn3[0];
     assign csr_imm_op = (opcode_trim == SYSTEM_T) & fn3[2];
     assign environment_op = (opcode_trim == SYSTEM_T) & (fn3 == 0);
+    
+    assign is_scaiev_isax = scaiev.decode_isSCAIEV & ~scaiev_decode_inject;
+    assign is_scaiev_isax_stdencoding = scaiev.decode_isSCAIEV_stdencoding & ~scaiev_decode_inject;
+    assign scaiev_uses_rs1 = is_scaiev_isax && scaiev.decode_isSCAIEV_usesRS1 || scaiev.decode_RS1_override;
+    assign scaiev_uses_rs2 = is_scaiev_isax && scaiev.decode_isSCAIEV_usesRS2 || scaiev.decode_RS2_override;
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign scaiev_uses_rd_as_rs = is_scaiev_isax && scaiev.decode_isSCAIEV_usesRD_AS_RS || scaiev.decode_RD_AS_RS_override;
+    end
+    else begin
+        assign scaiev_uses_rd_as_rs = 0;
+    end
+    assign scaiev_uses_rd = is_scaiev_isax && scaiev.decode_isSCAIEV_usesRD;
+
+    //SCAIE-V: Instruction repeat logic
+    assign pc_inject_keep_for_repeat = scaiev.decode_repeat_next;
+    assign pc_inject_is_repeat = decode_cur_is_repeat && !scaiev_decode_inject;
+    always_ff @(posedge clk) begin
+        if (rst || (decode_advance && !scaiev_decode_inject && !scaiev.decode_repeat_next) || (gc.fetch_flush | scaiev.issue_flush | scaiev.decode_flush)) begin
+            decode_cur_is_repeat <= 0;
+        end
+        else if (decode_advance && scaiev.decode_repeat_next && !scaiev_decode_inject) begin
+            decode_cur_is_repeat <= 1;
+        end
+    end
+    
+    generate if (ENABLE_DECOUPLED_WRITEBACK) begin
+        assign scaiev_uses_rd_decoupled = is_scaiev_isax && scaiev.decode_isSCAIEV_usesRD_decoupled;
+
+        logic [$clog2(32+1)-1:0] pending_decoupled; //SCAIE-V
+        //SCAIE-V decoupled writeback: prevent overuse of register file resources.
+        //CVA5 assumes that the number of in-flight instructions with a destination is max. 32  (see renamer.sv).
+        // Without decoupled writeback, this is bounded by MAX_IDS.
+        // However, launches with decoupled allocations would not be bounded without this logic.
+        always_ff @(posedge clk) begin
+            logic [$size(pending_decoupled)-1:0] next_pending_decoupled;
+            next_pending_decoupled = pending_decoupled;
+            if (scaiev_uses_rd_decoupled && !scaiev_decode_inject && decode_advance) begin
+                next_pending_decoupled = next_pending_decoupled + 6'd1;
+                if (next_pending_decoupled == 6'd0) begin
+                    $display("Error: next_pending_decoupled overflow");
+                    $finish;
+                end
+            end
+            //Assumption: scaiev.decode_wrReg -> final writeback of decoupled instruction
+            if (scaiev.rf_wrReg && scaiev.rf_ready && scaiev.rf_isDecoupledWB) begin
+                if (next_pending_decoupled == 6'd0) begin
+                    $display("Error: next_pending_decoupled underflow");
+                    $finish;
+                end
+                next_pending_decoupled = next_pending_decoupled - 6'd1;
+            end
+            if (rst) begin
+                pending_decoupled <= 0;
+            end
+            else begin
+                pending_decoupled <= next_pending_decoupled;
+            end
+            stall_rd_decoupled <= (next_pending_decoupled >= (32-MAX_IDS));
+        end
+        assign scaiev.no_writebacks_pending = (pending_decoupled == '0);
+    end
+    else begin
+        assign scaiev_uses_rd_decoupled = 0;
+        assign stall_rd_decoupled = 0;
+        assign scaiev.no_writebacks_pending = 1;
+    end endgenerate
 
     ////////////////////////////////////////////////////
     //Register File Support
-    assign uses_rs[RS1] = opcode_trim inside {JALR_T, BRANCH_T, LOAD_T, STORE_T, ARITH_IMM_T, ARITH_T, AMO_T} | is_csr;
-    assign uses_rs[RS2] = opcode_trim inside {BRANCH_T, ARITH_T, AMO_T};//Stores are exempted due to store forwarding
-    assign uses_rd = opcode_trim inside {LUI_T, AUIPC_T, JAL_T, JALR_T, LOAD_T, ARITH_IMM_T, ARITH_T} | is_csr;
+    assign uses_rs[RS1] = (opcode_trim inside {JALR_T, BRANCH_T, LOAD_T, STORE_T, ARITH_IMM_T, ARITH_T, AMO_T} && !is_scaiev_isax_stdencoding) | is_csr | scaiev_uses_rs1 | scaiev.decode_rdReg;
+    assign uses_rs[RS2] = (opcode_trim inside {BRANCH_T, ARITH_T, AMO_T} && !is_scaiev_isax_stdencoding) | scaiev_uses_rs2 | scaiev.decode_rdReg;//Stores are exempted due to store forwarding
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign uses_rs[RD_AS_RS] = scaiev_uses_rd_as_rs | scaiev.decode_rdReg;
+    end
+    assign uses_rd = 
+        ( ((opcode_trim inside {LUI_T, AUIPC_T, JAL_T, JALR_T, LOAD_T, ARITH_IMM_T, ARITH_T} && !is_scaiev_isax_stdencoding) | is_csr | scaiev_uses_rd)
+         && !scaiev.decode_skip_wb)
+         || scaiev_decode_inject;
+
+    assign scaiev.decode_RS1_valid = uses_rs[RS1];
+    assign scaiev.decode_RS1_id = rs_addr[RS1];
+    //The store queue supports wb forwarding. For stores, uses_rs[RS2] is not set (rs2: data), so they don't stall in Issue.
+    //This distinction is not relevant for SCAIE-V.
+    assign scaiev.decode_RS2_valid = uses_rs[RS2] || (opcode_trim inside {STORE_T});
+    assign scaiev.decode_RS2_id = rs_addr[RS2];
+    if (ENABLE_NATIVE_RD_AS_RS) begin
+        assign scaiev.decode_RD_AS_RS_valid = uses_rs[RD_AS_RS];
+        assign scaiev.decode_RD_AS_RS_id = rs_addr[RD_AS_RS];
+    end
+    else begin
+        assign scaiev.decode_RD_AS_RS_valid = 0;
+        assign scaiev.decode_RD_AS_RS_id = 0;
+    end
+    assign scaiev.decode_RD_valid = uses_rd;
+    assign scaiev.decode_RD_id = rd_addr;
 
     ////////////////////////////////////////////////////
     //Unit Determination
-    assign unit_needed[UNIT_IDS.BR] = opcode_trim inside {BRANCH_T, JAL_T, JALR_T};
-    assign unit_needed[UNIT_IDS.ALU] = (opcode_trim inside {ARITH_T, ARITH_IMM_T, AUIPC_T, LUI_T, JAL_T, JALR_T}) & ~mult_div_op;
+    assign unit_needed[UNIT_IDS.BR] = (opcode_trim inside {BRANCH_T, JAL_T, JALR_T} && !is_scaiev_isax_stdencoding);
+    assign unit_needed[UNIT_IDS.ALU] = (opcode_trim inside {ARITH_T, ARITH_IMM_T, AUIPC_T, LUI_T, JAL_T, JALR_T} && !is_scaiev_isax_stdencoding) & ~mult_div_op;
     assign unit_needed[UNIT_IDS.LS] = opcode_trim inside {LOAD_T, STORE_T, AMO_T} | is_fence;
     generate if (CONFIG.INCLUDE_CSRS)
         assign unit_needed[UNIT_IDS.CSR] = is_csr;
     endgenerate
     assign unit_needed[UNIT_IDS.IEC] = (opcode_trim inside {SYSTEM_T} & ~is_csr & CONFIG.INCLUDE_M_MODE) | is_ifence;
 
-    assign mult_div_op = (opcode_trim == ARITH_T) && decode.instruction[25];
+    assign mult_div_op = (opcode_trim == ARITH_T) && decode.instruction[25] && !is_scaiev_isax_stdencoding;
     generate if (CONFIG.INCLUDE_MUL)
         assign unit_needed[UNIT_IDS.MUL] = mult_div_op && ~fn3[2];
     endgenerate
 
     generate if (CONFIG.INCLUDE_DIV)
         assign unit_needed[UNIT_IDS.DIV] = mult_div_op && fn3[2];
+    endgenerate
+    
+    generate if (CONFIG.INCLUDE_SCAIEV)
+        assign unit_needed[UNIT_IDS.SCAIEV] = is_scaiev_isax; //SCAIE-V
     endgenerate
 
     ////////////////////////////////////////////////////
@@ -196,6 +335,7 @@ module decode_and_issue
     ////////////////////////////////////////////////////
     //Decode ID Support
     assign decode_uses_rd = uses_rd;
+    assign decode_uses_rd_decoupled = scaiev_uses_rd_decoupled && !scaiev.decode_skip_wb && !scaiev_decode_inject;
     assign decode_rd_addr = rd_addr;
     assign decode_phys_rd_addr = renamer.phys_rd_addr;
     assign decode_phys_rs_addr = renamer.phys_rs_addr;
@@ -206,7 +346,7 @@ module decode_and_issue
     always_ff @(posedge clk) begin
         if (issue_stage_ready) begin
             issue.pc <= decode.pc;
-            issue.instruction <= decode.instruction;
+            issue.instruction <= selected_instruction;
             issue.fetch_metadata <= decode.fetch_metadata;
             issue.fn3 <= fn3;
             issue.opcode <= opcode;
@@ -217,9 +357,12 @@ module decode_and_issue
             issue.phys_rd_addr <= renamer.phys_rd_addr;
             issue.is_multicycle <= ~unit_needed[UNIT_IDS.ALU];
             issue.id <= decode.id;
+            issue.pc_id <= decode.pc_id;
             issue.exception_unit <= decode_exception_unit;
             issue_uses_rs <= uses_rs;
             issue.uses_rd <= uses_rd;
+            issue_is_injected <= scaiev_decode_inject || decode_cur_is_repeat;
+            issue_uses_rd_decoupled <= decode_uses_rd_decoupled;
         end
     end
 
@@ -229,10 +372,10 @@ module decode_and_issue
     end
 
     always_ff @(posedge clk) begin
-        if (rst | gc.fetch_flush)
+        if (rst | gc.fetch_flush | scaiev.issue_flush)
             issue.stage_valid <= 0;
         else if (issue_stage_ready)
-            issue.stage_valid <= decode.valid;
+            issue.stage_valid <= decode_valid & ~(scaiev_uses_rd_decoupled & stall_rd_decoupled) & ~scaiev.decode_stall & ~(scaiev.decode_flush | scaiev.issue_flush);
     end
 
     ////////////////////////////////////////////////////
@@ -249,11 +392,14 @@ module decode_and_issue
     assign operands_ready = ~|rs_conflict;
 
     assign issue_ready = unit_needed_issue_stage & unit_ready;
-    assign issue_valid = issue.stage_valid & operands_ready & ~gc.issue_hold & ~pre_issue_exception_pending;
+    assign issue_valid_or_waiting_for_operands = issue.stage_valid & ~pre_issue_exception_pending;
+    assign issue_valid_prescaiev = issue_valid_or_waiting_for_operands & operands_ready & ~gc.issue_hold;
+    assign issue_valid = issue_valid_prescaiev
+                         & ~scaiev_stall_issue & ~scaiev.issue_stall; //SCAIE-V
 
-    assign issue_to = {NUM_UNITS{issue_valid & ~gc.fetch_flush}} & issue_ready;
+    assign issue_to = {NUM_UNITS{issue_valid & ~gc.fetch_flush & ~scaiev.issue_flush}} & issue_ready;
 
-    assign instruction_issued = issue_valid & ~gc.fetch_flush & |issue_ready;
+    assign instruction_issued = issue_valid & ~gc.fetch_flush & ~scaiev.issue_flush & |issue_ready;
     assign instruction_issued_with_rd = instruction_issued & issue.uses_rd;
 
     ////////////////////////////////////////////////////
@@ -262,7 +408,7 @@ module decode_and_issue
     assign rf.phys_rd_addr = issue.phys_rd_addr;
     assign rf.rs_wb_group = issue_rs_wb_group;
     
-    assign rf.single_cycle_or_flush = (instruction_issued_with_rd & |issue.rd_addr & ~issue.is_multicycle) | (issue.stage_valid & issue.uses_rd & |issue.rd_addr & gc.fetch_flush);
+    assign rf.single_cycle_or_flush = (instruction_issued_with_rd & |issue.rd_addr & ~issue.is_multicycle) | (issue.stage_valid & (issue.uses_rd | issue_uses_rd_decoupled) & |issue.rd_addr & (gc.fetch_flush | scaiev.issue_flush));
     
     ////////////////////////////////////////////////////
     //ALU unit inputs
@@ -304,7 +450,8 @@ module decode_and_issue
     //  provides PC+4 for BRANCH unit and ifence in GC unit
     always_ff @(posedge clk) begin
         if (issue_stage_ready) begin
-            constant_alu <= ((opcode_trim inside {LUI_T}) ? '0 : decode.pc) + ((opcode_trim inside {LUI_T, AUIPC_T}) ? {decode.instruction[31:12], 12'b0} : 4); 
+            constant_alu <= ((opcode_trim inside {LUI_T}) ? '0 : ((!scaiev.decode_wrReg) ? decode.pc : scaiev.decode_wrReg_data))
+                             + ((opcode_trim inside {LUI_T, AUIPC_T}) ? {(!scaiev.decode_wrReg) ? decode.instruction[31:12] : 20'b0, 12'b0} : 4); 
             alu_imm_type <= opcode_trim inside {ARITH_IMM_T};
             alu_op_r <= alu_op;
             alu_subtract <= (fn3 inside {SLTU_fn3, SLT_fn3}) || sub_instruction;
@@ -375,16 +522,45 @@ module decode_and_issue
         if (instruction_issued_with_rd)
             rd_to_id_table[issue.rd_addr] <= issue.id;
     end
+    logic rd_scaiev_decoupled_table [32];
+    generate if (ENABLE_DECOUPLED_WRITEBACK) begin
+        always_ff @ (posedge clk) begin
+            if (rst) begin
+                foreach(rd_scaiev_decoupled_table[i])
+                    rd_scaiev_decoupled_table[i] <= 0;
+            end
+            //No need to explicitly reset on writeback, as rf.inuse[RS2] determines whether LS forwarding should be used.
+            else if (instruction_issued)
+                rd_scaiev_decoupled_table[issue.rd_addr] <= issue_uses_rd_decoupled;
+        end
+    end
+    else begin
+        for (i=0; i<32; i++)
+            assign rd_scaiev_decoupled_table[i] = 0;
+    end endgenerate
 
     assign ls_inputs.offset = ls_offset;
     assign ls_inputs.load = is_load_r;
     assign ls_inputs.store = is_store_r;
+    assign ls_inputs.relaxed_load_ordering = 0;
     assign ls_inputs.fence = is_fence_r;
     assign ls_inputs.fn3 = amo_op ? LS_W_fn3 : issue.fn3;
     assign ls_inputs.rs1 = rf.data[RS1];
     assign ls_inputs.rs2 = rf.data[RS2];
     assign ls_inputs.forwarded_store = rf.inuse[RS2];
-    assign ls_inputs.store_forward_id = rd_to_id_table[issue_rs_addr[RS2]];
+    //(extra wire so always_comb block sees it immediately in Verilator simulation)
+    wire store_forward_is_from_instruction = !rd_scaiev_decoupled_table[issue_rs_addr[RS2]];
+    assign ls_inputs.store_forward_id.is_from_instruction = store_forward_is_from_instruction;
+    always_comb begin
+        ls_inputs.store_forward_id.id.instruction.id = 'X;
+        ls_inputs.store_forward_id.id.instruction.pad = 'X;
+        ls_inputs.store_forward_id.id.register_addr = 'X;
+        if (store_forward_is_from_instruction)
+            ls_inputs.store_forward_id.id.instruction.id = rd_to_id_table[issue_rs_addr[RS2]];
+        else
+            ls_inputs.store_forward_id.id.register_addr = issue_phys_rs_addr[RS2];
+    end
+    //assign ls_inputs.store_forward_id = rd_to_id_table[issue_rs_addr[RS2]];
 
     ////////////////////////////////////////////////////
     //Branch unit inputs
@@ -437,6 +613,7 @@ module decode_and_issue
         end
     end
 
+    assign branch_inputs.pc_id = issue.pc_id;
     assign branch_inputs.is_return = is_return;
     assign branch_inputs.is_call = is_call;
     assign branch_inputs.fn3 = issue.fn3;
@@ -547,6 +724,47 @@ module decode_and_issue
         assign div_inputs.op = issue.fn3[1:0];
         assign div_inputs.reuse_result = div_op_reuse;
     end endgenerate
+    
+    ////////////////////////////////////////////////////
+    //SCAIE-V unit inputs
+    generate if (CONFIG.INCLUDE_SCAIEV) begin : gen_decode_scaiev_inputs
+        assign scaiev_inputs.rs1 = rf.data[RS1];
+        assign scaiev_inputs.rs2 = rf.data[RS2];
+        if (ENABLE_NATIVE_RD_AS_RS) begin
+            assign scaiev_inputs.rd_as_rs = rf.data[RD_AS_RS];
+        end
+        else begin
+            assign scaiev_inputs.rd_as_rs = 0;
+        end
+        assign scaiev_inputs.instruction = issue.instruction;
+        assign scaiev_inputs.pc = issue.pc;
+        assign scaiev_inputs.uses_rd = issue.uses_rd;
+
+        assign scaiev.issue_PC = issue.pc;
+        assign scaiev.issue_RS1_valid = !rs_conflict[RS1];
+        assign scaiev.issue_RS1 = rf.data[RS1];
+        assign scaiev.issue_RS2_valid = !rs_conflict[RS2];
+        assign scaiev.issue_RS2 = rf.data[RS2];
+        if (ENABLE_NATIVE_RD_AS_RS) begin
+            assign scaiev.issue_RD_AS_RS_valid = !rs_conflict[RD_AS_RS];
+            assign scaiev.issue_RD_AS_RS = rf.data[RD_AS_RS];
+        end
+        else begin
+            assign scaiev.issue_RD_AS_RS_valid = 0;
+            assign scaiev.issue_RD_AS_RS = '0;
+        end
+        assign scaiev.issue_RD_valid = issue.uses_rd;
+        assign scaiev.issue_RD_id = issue.rd_addr;
+        assign scaiev.issue_Instr = issue.instruction;
+        assign scaiev.issue_valid = issue_valid_or_waiting_for_operands;
+        assign scaiev.decode_isStalling = !(decode_valid & issue_stage_ready);
+        assign scaiev.issue_isStalling = !issue_valid_prescaiev || !(|issue_ready) || gc.fetch_flush || scaiev.issue_flush;
+        assign scaiev.issue_isSCAIEV = unit_needed_issue_stage[UNIT_IDS.SCAIEV];
+        assign scaiev.issue_isLS = unit_needed_issue_stage[UNIT_IDS.LS];
+
+        assign scaiev.issue_injected = issue_is_injected;
+        assign scaiev.issue_phys_RD_decoupled = issue.phys_rd_addr;
+    end endgenerate
 
     ////////////////////////////////////////////////////
     //Unit EX signals
@@ -562,8 +780,9 @@ module decode_and_issue
     generate if (CONFIG.INCLUDE_M_MODE) begin : gen_decode_exceptions
     illegal_instruction_checker # (.CONFIG(CONFIG))
     illegal_op_check (
-        .instruction(decode.instruction), .illegal_instruction(illegal_instruction_pattern)
+        .instruction(decode.instruction), .illegal_instruction(illegal_instruction_pattern_prescaiev)
     );
+    assign illegal_instruction_pattern = illegal_instruction_pattern_prescaiev & (~scaiev.decode_isSCAIEV);
     always_ff @(posedge clk) begin
         if (rst)
             illegal_instruction_pattern_r <= 0;
@@ -608,7 +827,7 @@ module decode_and_issue
             pre_issue_exception_pending <= illegal_instruction_pattern | (opcode_trim inside {SYSTEM_T} & ~is_csr & (sys_op_match[ECALL_i] | sys_op_match[EBREAK_i])) | ~decode.fetch_metadata.ok;
     end
 
-    assign new_exception = issue.stage_valid & pre_issue_exception_pending & ~(gc.issue_hold | gc.fetch_flush);
+    assign new_exception = issue.stage_valid & pre_issue_exception_pending & ~(gc.issue_hold | gc.fetch_flush | scaiev.issue_flush);
 
     always_ff @(posedge clk) begin
         if (rst)
@@ -642,10 +861,10 @@ module decode_and_issue
     ////////////////////////////////////////////////////
     //Trace Interface
     generate if (ENABLE_TRACE_INTERFACE) begin : gen_decode_trace
-        assign tr_operand_stall = issue.stage_valid & ~gc.fetch_flush & ~gc.issue_hold & ~pre_issue_exception_pending & ~operands_ready & |issue_ready;
-        assign tr_unit_stall = issue_valid & ~gc.fetch_flush & ~|issue_ready;
-        assign tr_no_id_stall = (~issue.stage_valid & ~pc_id_available & ~gc.fetch_flush); //All instructions in execution pipeline
-        assign tr_no_instruction_stall = (pc_id_available & ~issue.stage_valid) | gc.fetch_flush;
+        assign tr_operand_stall = issue.stage_valid & ~gc.fetch_flush & ~scaiev.issue_flush & ~gc.issue_hold & ~pre_issue_exception_pending & ~operands_ready & |issue_ready;
+        assign tr_unit_stall = issue_valid & ~gc.fetch_flush & ~scaiev.issue_flush & ~|issue_ready;
+        assign tr_no_id_stall = (~issue.stage_valid & ~pc_id_available & ~gc.fetch_flush & ~scaiev.issue_flush); //All instructions in execution pipeline
+        assign tr_no_instruction_stall = (pc_id_available & ~issue.stage_valid) | gc.fetch_flush | scaiev.issue_flush;
         assign tr_other_stall = issue.stage_valid & ~instruction_issued & ~(tr_operand_stall | tr_unit_stall | tr_no_id_stall | tr_no_instruction_stall);
         assign tr_branch_operand_stall = tr_operand_stall & unit_needed_issue_stage[UNIT_IDS.BR];
         assign tr_alu_operand_stall = tr_operand_stall & unit_needed_issue_stage[UNIT_IDS.ALU] & ~unit_needed_issue_stage[UNIT_IDS.BR];

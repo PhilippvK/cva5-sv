@@ -24,7 +24,7 @@ package csr_types;
     import cva5_config::*;
     import riscv_types::*;
 
-    const logic [1:0] CSR_READ_ONLY = 2'b11;
+    localparam logic [1:0] CSR_READ_ONLY = 2'b11;
 
     typedef enum logic [1:0] {
         USER_PRIVILEGE = 2'b00,

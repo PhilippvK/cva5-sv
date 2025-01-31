@@ -37,7 +37,7 @@ module one_hot_to_integer
     end else begin : gen_width_two_plus
         always_comb begin
             int_out = 0;
-            foreach(one_hot[i])
+            for (int i = 0; i < $size(one_hot); i++)
                 int_out |= one_hot[i] ? $clog2(C_WIDTH)'(i) : 0;
         end
     end
