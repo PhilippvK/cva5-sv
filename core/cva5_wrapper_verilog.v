@@ -18,10 +18,10 @@ module cva5_wrapper_verilog (
 	input wire clk,
 	input wire rst,
 
-	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram CLK" *)
-	output wire        instruction_bram_clk,
-	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram RST" *)
-	output wire        instruction_bram_rst,
+	// (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram CLK" *)
+	// output wire        instruction_bram_clk,
+	// (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram RST" *)
+	// output wire        instruction_bram_rst,
 	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram ADDR" *)
 	output wire [29:0] instruction_bram_addr,
 	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram EN" *)
@@ -33,10 +33,10 @@ module cva5_wrapper_verilog (
 	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 instruction_bram DOUT" *)
 	input  wire [31:0] instruction_bram_dout,
 
-	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 data_bram CLK" *)
-	output wire        data_bram_clk,
-	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 data_bram RST" *)
-	output wire        data_bram_rst,
+	// (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 data_bram CLK" *)
+	// output wire        data_bram_clk,
+	// (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 data_bram RST" *)
+	// output wire        data_bram_rst,
 	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 data_bram ADDR" *)
 	output wire [29:0] data_bram_addr,
 	(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 data_bram EN" *)
@@ -164,13 +164,15 @@ cva5_wrapper cva5_wrapper (
 	.clk(clk),
 	.rst(rst),
 
-	.instruction_bram_addr(instruction_bram_addr),
+	// .instruction_bram_addr(instruction_bram_addr),
+	.instruction_bram_addr(instruction_bram_addr_long),
 	.instruction_bram_en(instruction_bram_en),
 	.instruction_bram_we(instruction_bram_we),
 	.instruction_bram_din(instruction_bram_din),
 	.instruction_bram_dout(instruction_bram_dout),
 
-	.data_bram_addr(data_bram_addr),
+	// .data_bram_addr(data_bram_addr),
+	.data_bram_addr(data_bram_addr_long),
 	.data_bram_en(data_bram_en),
 	.data_bram_we(data_bram_we),
 	.data_bram_din(data_bram_din),
