@@ -1,6 +1,7 @@
 puts "This script will create a system project for CVA5 in the current folder to run a demo application from block memory on the Nexys A7-100T"
 puts "You should install the board support files from https://github.com/Digilent/vivado-boards before running this script"
 
+set_param board.repoPaths {/home/ga87puy/.Xilinx/Vivado/2024.1/data/boards/board_files}
 # Create the project
 create_project -force -part xc7a100tcsg324-1 CVA5BD ./vivado/CVA5BD
 set_property board_part digilentinc.com:nexys-a7-100t:part0:1.3 [current_project]
@@ -14,7 +15,7 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_uartlite:2.0 axi_uartlite_0
 apply_board_connection -board_interface "usb_uart" -ip_intf "axi_uartlite_0/UART" -diagram "soc"
 # Reset
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 proc_sys_reset_0
-apply_board_connection -board_interface "reset" -ip_intf "proc_sys_reset_0/ext_reset" -diagram "soc" 
+apply_board_connection -board_interface "reset" -ip_intf "proc_sys_reset_0/ext_reset" -diagram "soc"
 # Clock
 create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:6.0 clk_wiz_0
 # Connect to clock on board

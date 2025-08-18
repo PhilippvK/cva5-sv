@@ -149,7 +149,7 @@ package cva5_config;
     typedef unit_id_enum_t [MAX_NUM_UNITS-1:0][MAX_NUM_UNITS-1:0] wb_group_config_t;
 
     //Convenience function for determining how many writeback units are in each writeback group
-    function int unsigned get_num_wb_units (input unit_id_enum_t [MAX_NUM_UNITS-1:0] ids);
+    function automatic int unsigned get_num_wb_units (input unit_id_enum_t [MAX_NUM_UNITS-1:0] ids);
         get_num_wb_units = 0;
         for (int i = 0; i < MAX_NUM_UNITS; i++)
             if (ids[i] != NON_WRITEBACK_ID)
@@ -158,7 +158,7 @@ package cva5_config;
 
     //Convenience function for turning the enum-based WB grouping into the units_t bit-vector representation
     //used in decode stage to determine the writeback group for the current instruction
-    function units_t [MAX_NUM_UNITS-1:0] get_wb_units_type_representation(input wb_group_config_t ids);
+    function automatic units_t [MAX_NUM_UNITS-1:0] get_wb_units_type_representation(input wb_group_config_t ids);
         get_wb_units_type_representation = '{default : '0};
         for (int i = 0; i < MAX_NUM_UNITS; i++)
             for (int j = 0; j < MAX_NUM_UNITS; j++)
@@ -176,7 +176,7 @@ package cva5_config;
 
         //Units
         units_t INCLUDE_UNIT; //Value of ALU, LS, BR, and GC ignored
-    
+
         //CSR constants
         csr_config_t CSRS;
         //Memory Options
@@ -214,7 +214,7 @@ package cva5_config;
 
     //Function to generate derived cache parameters
     //Tag width based off of memory size and cache parameters
-    function derived_cache_config_t get_derived_cache_params (input cpu_config_t cpu, input cache_config_t cache, input memory_config_t addr);
+    function automatic derived_cache_config_t get_derived_cache_params (input cpu_config_t cpu, input cache_config_t cache, input memory_config_t addr);
         return '{
             LINE_ADDR_W : $clog2(cache.LINES),
             SUB_LINE_ADDR_W : $clog2(cache.LINE_W),
@@ -233,7 +233,8 @@ package cva5_config;
         0 : '{0: ALU_ID, default : NON_WRITEBACK_ID},
         1 : '{0: LS_ID, default : NON_WRITEBACK_ID},
         2 : '{0: MUL_ID, 1: DIV_ID, 2: CSR_ID, 3: FPU_ID, 4: CUSTOM_ID, default : NON_WRITEBACK_ID},
-        default : '{default : NON_WRITEBACK_ID}
+        3 : '{default: NON_WRITEBACK_ID},  // replace with literal values if needed
+        4 : '{default: NON_WRITEBACK_ID}  // or remove if NUM_GROUPS = 3
     };
 
     localparam cpu_config_t EXAMPLE_CONFIG = '{
@@ -311,7 +312,7 @@ package cva5_config;
         },
         INCLUDE_ILOCAL_MEM : 0,
         ILOCAL_MEM_ADDR : '{
-            L : 32'h80000000, 
+            L : 32'h80000000,
             H : 32'h8FFFFFFF
         },
         INCLUDE_DLOCAL_MEM : 0,
@@ -321,7 +322,7 @@ package cva5_config;
         },
         INCLUDE_IBUS : 0,
         IBUS_ADDR : '{
-            L : 32'h60000000, 
+            L : 32'h60000000,
             H : 32'h6FFFFFFF
         },
         INCLUDE_PERIPHERAL_BUS : 1,
